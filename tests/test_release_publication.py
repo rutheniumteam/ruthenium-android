@@ -183,22 +183,28 @@ class ReleasePublicationTest(unittest.TestCase):
             "export ARTIFACT_CACHE_KEY", 1
         )[0]
         for component in (
-            "$RUTHENIUM_RELEASE_ID",
+            "$RELEASE_DIGEST",
             "$ANDROID_ABI",
             "$TARGET_CPU",
         ):
             self.assertIn(component, key_block)
-        self.assertNotIn("$RELEASE_DIGEST", key_block)
-        self.assertIn(
-            'grep -qxF "Ruthenium release $RUTHENIUM_RELEASE_ID" build-info.txt',
-            pipeline,
-        )
-        self.assertIn(
-            'grep -qxF "Ministry CA DER SHA-256 $MINISTRY_CA_DER_SHA256" '
-            "build-info.txt",
-            pipeline,
-        )
+        self.assertNotIn("$RUTHENIUM_RELEASE_ID", key_block)
         self.assertIn('test ! -e "$RELEASE_APK.idsig"', pipeline)
+
+    def test_cached_apk_gets_current_release_metadata_without_rebuild(self):
+        pipeline = (REPOSITORY_ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
+        reuse_block = pipeline.split(
+            'if [ -f "$ARTIFACT_CACHE_DIR/$RELEASE_APK_NAME.sha256" ]; then', 1
+        )[1].split("exit 0", 1)[0]
+        self.assertIn('cp -a "$ARTIFACT_CACHE_DIR/."', reuse_block)
+        self.assertIn("write_build_info build-info.txt", reuse_block)
+        self.assertLess(
+            reuse_block.index('cp -a "$ARTIFACT_CACHE_DIR/."'),
+            reuse_block.index("write_build_info build-info.txt"),
+        )
+        self.assertNotIn("autoninja", reuse_block)
+        self.assertEqual(2, pipeline.count("write_build_info build-info.txt"))
+        self.assertEqual(1, pipeline.count("printf 'Product Ruthenium"))
 
     def test_release_asset_namespace_rejects_unexpected_files(self):
         with self.assertRaisesRegex(

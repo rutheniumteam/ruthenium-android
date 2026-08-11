@@ -537,18 +537,27 @@ preflight:
       keytool -exportcert -rfc -storetype PKCS12 -keystore "$SIGNING_KEYSTORE" -storepass:env RUTHENIUM_KEYSTORE_PASSWORD -alias ruthenium-release -file "$SIGNING_CERTIFICATE"
       test "$(openssl x509 -in "$SIGNING_CERTIFICATE" -noout -fingerprint -sha256 | cut -d= -f2)" = "$RUTHENIUM_SIGNING_CERT_SHA256"
 
-      # The finished artifact set includes release metadata as well as the APK,
-      # so key it by the complete release identity and the architecture. This
-      # also invalidates old metadata when the release-ID scheme itself changes.
-      # When the key is unchanged, a rebuild reproduces the existing set.
+      # The APK is a function of the release inputs, which is exactly what the
+      # release digest covers, plus the architecture. When the key is unchanged
+      # a rebuild reproduces artifacts that already exist, so keep the finished
+      # set under it and reuse it instead. Any input change moves the digest,
+      # which moves both the key and the release identity, and rebuilds.
       export ARTIFACT_CACHE_ROOT="$CI_BUILDS_DIR/ruthenium-artifact-cache"
+      RELEASE_DIGEST="$(
+        python3 scripts/release_identity.py --root "$CI_PROJECT_DIR" --field digest
+      )"
+      [[ "$RELEASE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
       RUTHENIUM_RELEASE_ID="$(
         python3 scripts/release_identity.py --root "$CI_PROJECT_DIR"
       )"
       [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-ca-[0-9a-f]{12}-[0-9a-f]{12}$ ]]
       export RUTHENIUM_RELEASE_ID
+      write_build_info() {
+        local output_path="$1"
+        printf 'Product Ruthenium\nApplication ID %s\nChromium %s\nRevision %s\nRuthenium release %s\nArchitecture %s\nChromium target CPU %s\nScoped CA DNS names .ru,.xn--p1ai\nMinistry CA source https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt\nMinistry CA DER SHA-256 %s\nSigning certificate SHA-256 %s\n' "$RUTHENIUM_APPLICATION_ID" "$CHROMIUM_VERSION" "$CHROMIUM_REVISION" "$RUTHENIUM_RELEASE_ID" "$ANDROID_ABI" "$TARGET_CPU" "$MINISTRY_CA_DER_SHA256" "$RUTHENIUM_SIGNING_CERT_SHA256" > "$output_path"
+      }
       ARTIFACT_CACHE_KEY="$(
-        printf '%s\n' "$RUTHENIUM_RELEASE_ID" "$ANDROID_ABI" "$TARGET_CPU" \
+        printf '%s\n' "$RELEASE_DIGEST" "$ANDROID_ABI" "$TARGET_CPU" \
           | sha256sum | cut -d' ' -f1
       )"
       export ARTIFACT_CACHE_KEY
@@ -564,11 +573,9 @@ preflight:
         grep -F "$RUTHENIUM_APPLICATION_ID" aapt2-badging.txt
         grep -F "application-label" aapt2-badging.txt | grep -F "Ruthenium"
         test "$(cat apk-abis.txt)" = "$ANDROID_ABI"
-        grep -qxF "Chromium $CHROMIUM_VERSION" build-info.txt
-        grep -qxF "Revision $CHROMIUM_REVISION" build-info.txt
-        grep -qxF "Ruthenium release $RUTHENIUM_RELEASE_ID" build-info.txt
-        grep -qxF "Chromium target CPU $TARGET_CPU" build-info.txt
-        grep -qxF "Ministry CA DER SHA-256 $MINISTRY_CA_DER_SHA256" build-info.txt
+        grep -qF "Revision $CHROMIUM_REVISION" build-info.txt
+        grep -qF "Chromium $CHROMIUM_VERSION" build-info.txt
+        write_build_info build-info.txt
         df -hT "$CI_BUILDS_DIR"
         exit 0
       fi
@@ -653,7 +660,7 @@ preflight:
       grep -F "application-label" "$CI_PROJECT_DIR/artifacts/aapt2-badging.txt" | grep -F "Ruthenium"
       cd "$CI_PROJECT_DIR/artifacts"
       sha256sum "Ruthenium-${CHROMIUM_VERSION}-${ANDROID_ABI}.apk" > "Ruthenium-${CHROMIUM_VERSION}-${ANDROID_ABI}.apk.sha256"
-      printf 'Product Ruthenium\nApplication ID %s\nChromium %s\nRevision %s\nRuthenium release %s\nArchitecture %s\nChromium target CPU %s\nScoped CA DNS names .ru,.xn--p1ai\nMinistry CA source https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt\nMinistry CA DER SHA-256 %s\nSigning certificate SHA-256 %s\n' "$RUTHENIUM_APPLICATION_ID" "$CHROMIUM_VERSION" "$CHROMIUM_REVISION" "$RUTHENIUM_RELEASE_ID" "$ANDROID_ABI" "$TARGET_CPU" "$MINISTRY_CA_DER_SHA256" "$RUTHENIUM_SIGNING_CERT_SHA256" > build-info.txt
+      write_build_info build-info.txt
       rm -rf -- "$ARTIFACT_CACHE_DIR"
       mkdir -p "$ARTIFACT_CACHE_DIR"
       cp -a "$CI_PROJECT_DIR/artifacts/." "$ARTIFACT_CACHE_DIR/"
