@@ -130,6 +130,14 @@ class MinistryCaUpdateTest(unittest.TestCase):
         """A CA rollover changes the trust lock, and nothing about the CI file."""
         self.assertNotIn("pipeline", check_ministry_ca.update_repository.__code__.co_varnames)
 
+    def test_pipeline_accepts_the_exact_ca_only_file_set(self):
+        pipeline = (REPOSITORY_ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
+        self.assertIn('if [ "$CHROMIUM_CHANGED" = 1 ]; then', pipeline)
+        self.assertIn('chromium_changed, ca_changed = sys.argv[6:8]', pipeline)
+        self.assertIn('if chromium_changed == "1":', pipeline)
+        self.assertIn('if ca_changed == "1":', pipeline)
+        self.assertIn('set(changed) != expected', pipeline)
+
 
 if __name__ == "__main__":
     unittest.main()

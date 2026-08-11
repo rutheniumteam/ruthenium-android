@@ -38,7 +38,9 @@ def identity(**overrides: bytes) -> str:
 class ReleaseIdentityTest(unittest.TestCase):
     def test_identity_is_pinned_to_this_algorithm(self):
         """A silent change here would rename every release for no reason."""
-        self.assertEqual("android-151.0.7922.108-8d2cf64ab8e5", identity())
+        self.assertEqual(
+            "android-151.0.7922.108-ca-dddddddddddd-8d2cf64ab8e5", identity()
+        )
 
     def test_every_build_input_moves_the_identity(self):
         baseline = identity()
@@ -63,6 +65,17 @@ class ReleaseIdentityTest(unittest.TestCase):
     def test_identity_names_the_chromium_version_it_builds(self):
         self.assertTrue(identity().startswith(f"android-{VERSION}-"))
         self.assertTrue(release_identity.RELEASE_ID_RE.fullmatch(identity()))
+
+    def test_identity_names_the_ministry_ca_it_builds(self):
+        self.assertIn("-ca-dddddddddddd-", identity())
+        changed = identity(
+            **{
+                "certificates__ministry-ca-lock.json": json.dumps(
+                    {"der_sha256": "e" * 64}
+                ).encode()
+            }
+        )
+        self.assertIn("-ca-eeeeeeeeeeee-", changed)
 
     def test_malformed_inputs_are_refused(self):
         cases = {

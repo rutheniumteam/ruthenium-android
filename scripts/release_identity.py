@@ -46,8 +46,11 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 APPLICATION_ID_RE = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+")
 CERTIFICATE_SHA256_RE = re.compile(r"(?:[0-9A-F]{2}:){31}[0-9A-F]{2}")
 
+CA_DIGEST_LENGTH = 12
 DIGEST_LENGTH = 12
-RELEASE_ID_RE = re.compile(r"android-[0-9]+(?:\.[0-9]+){3}-[0-9a-f]{12}")
+RELEASE_ID_RE = re.compile(
+    r"android-[0-9]+(?:\.[0-9]+){3}-ca-[0-9a-f]{12}-[0-9a-f]{12}"
+)
 
 PIPELINE_FIELDS: dict[str, tuple[re.Pattern[str], re.Pattern[str]]] = {
     "chromium_version": (
@@ -128,7 +131,11 @@ def release_digest(inputs: dict[str, str]) -> str:
 
 def release_id(inputs: dict[str, str]) -> str:
     version = inputs["chromium_version"]
-    value = f"android-{version}-{release_digest(inputs)[:DIGEST_LENGTH]}"
+    ca_digest = inputs["ministry_ca_der_sha256"][:CA_DIGEST_LENGTH]
+    value = (
+        f"android-{version}-ca-{ca_digest}-"
+        f"{release_digest(inputs)[:DIGEST_LENGTH]}"
+    )
     if not RELEASE_ID_RE.fullmatch(value):
         raise ReleaseIdentityError(f"invalid release identity: {value!r}")
     return value

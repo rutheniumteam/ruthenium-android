@@ -286,7 +286,10 @@ def create_release(
 
 def release_title(manifest: dict[str, Any]) -> str:
     """The single definition of a release title, written and checked alike."""
-    return f"Ruthenium {manifest['chromium_version']}"
+    ca_digest = str(manifest["ministry_ca_der_sha256"])[
+        : prepare_github_release.release_identity.CA_DIGEST_LENGTH
+    ]
+    return f"Ruthenium {manifest['chromium_version']} (CA {ca_digest})"
 
 
 def release_body(manifest: dict[str, Any]) -> str:

@@ -21,7 +21,6 @@ def _runner_env() -> dict[str, str]:
     env.pop("PYTHONPATH", None)
     return env
 VERSION = "151.0.7922.71"
-RELEASE_ID = f"android-{VERSION}-0123456789ab"
 REVISION = "ef35003457e93c278f911a334b06e4a5f8967e06"
 ABI = "arm64-v8a"
 TARGET_CPU = "arm64"
@@ -35,6 +34,9 @@ ASSET_URL = (
     "https://api.github.com/repos/rutheniumteam/ruthenium-android/releases/assets/1"
 )
 MINISTRY_CA_DER_SHA256 = patch_chromium.EXPECTED_DER_SHA256
+RELEASE_ID = (
+    f"android-{VERSION}-ca-{MINISTRY_CA_DER_SHA256[:12]}-0123456789ab"
+)
 
 
 class ReleasePublicationTest(unittest.TestCase):
@@ -298,10 +300,15 @@ class ReleasePublicationTest(unittest.TestCase):
             )
         self.assertEqual(0, result.returncode, result.stderr)
 
-    def test_release_title_is_just_the_version(self):
-        manifest = {"chromium_version": VERSION, "release_tag": RELEASE_ID}
+    def test_release_title_names_the_version_and_ca(self):
+        manifest = {
+            "chromium_version": VERSION,
+            "release_tag": RELEASE_ID,
+            "ministry_ca_der_sha256": MINISTRY_CA_DER_SHA256,
+        }
         self.assertEqual(
-            f"Ruthenium {VERSION}", publish_github_release.release_title(manifest)
+            f"Ruthenium {VERSION} (CA {MINISTRY_CA_DER_SHA256[:12]})",
+            publish_github_release.release_title(manifest),
         )
 
     def test_release_title_has_one_definition(self):

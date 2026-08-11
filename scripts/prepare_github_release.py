@@ -228,6 +228,12 @@ def create_bundle(
         raise ReleaseBundleError("invalid Android application ID")
     if not SHA256_RE.fullmatch(ministry_ca_der_sha256):
         raise ReleaseBundleError("invalid Ministry CA DER SHA-256")
+    expected_release_prefix = (
+        f"android-{version}-ca-"
+        f"{ministry_ca_der_sha256[:release_identity.CA_DIGEST_LENGTH]}-"
+    )
+    if not release_id.startswith(expected_release_prefix):
+        raise ReleaseBundleError("release identity does not name this Ministry CA")
     signing_sha256 = normalize_certificate_fingerprint(signing_fingerprint)
     if not SHA256_RE.fullmatch(source_snapshot_sha256):
         raise ReleaseBundleError("invalid public source snapshot SHA-256")
@@ -381,10 +387,14 @@ def verify_bundle(bundle_directory: Path) -> dict[str, object]:
         value = manifest.get(key)
         if not isinstance(value, str) or not re.fullmatch(pattern, value):
             raise ReleaseBundleError(f"invalid bundle field: {key}")
-    if not str(manifest["release_tag"]).startswith(
-        f"android-{manifest['chromium_version']}-"
-    ):
-        raise ReleaseBundleError("release tag does not name the bundled Chromium version")
+    expected_release_prefix = (
+        f"android-{manifest['chromium_version']}-ca-"
+        f"{str(manifest['ministry_ca_der_sha256'])[:release_identity.CA_DIGEST_LENGTH]}-"
+    )
+    if not str(manifest["release_tag"]).startswith(expected_release_prefix):
+        raise ReleaseBundleError(
+            "release tag does not name the bundled Chromium version and Ministry CA"
+        )
     if ABI_TARGETS.get(str(manifest["abi"])) != manifest["chromium_target_cpu"]:
         raise ReleaseBundleError("bundle ABI and target CPU do not match")
 

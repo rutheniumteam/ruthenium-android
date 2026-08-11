@@ -134,18 +134,20 @@ an empty commit.
 
 Every architecture has its own build job and its own GitHub release-publication
 job, and a release pipeline runs the whole chain end to end. All APKs for one
-Ruthenium release use the tag `android-<Chromium version>-<release digest>` and
-remain separate ABI-specific assets; no universal APK silently combines different
-native builds.
+Ruthenium release use the tag
+`android-<Chromium version>-ca-<CA digest>-<release digest>` and remain separate
+ABI-specific assets; no universal APK silently combines different native builds.
 
-The release digest is the first 12 hex characters of a SHA-256 over the inputs
-that decide what the APK contains: the Chromium version and revision, the
-application ID, the signing certificate, the pinned Ministry root, and the exact
-bytes of `build/args.gn` and `scripts/patch_chromium.py`. Every one of those is
-published, so a checkout can recompute the digest and confirm that a release tag
-belongs to the source it claims. Equal inputs always name the same release, and
-any change to them names a different one, with no counter to maintain and no way
-for a changed build to land in a release that is already public.
+The CA digest is the first 12 hex characters of the pinned Ministry root's DER
+SHA-256. The release digest is the first 12 hex characters of a SHA-256 over all
+inputs that decide what the APK contains: the Chromium version and revision,
+the application ID, the signing certificate, the same pinned Ministry root,
+and the exact bytes of `build/args.gn` and `scripts/patch_chromium.py`. Every one
+of those is published, so a checkout can recompute both identifiers and confirm
+that a release tag belongs to the source it claims. Equal inputs always name the
+same release, and any change to them names a different one, with no counter to
+maintain and no way for a changed build to land in a release that is already
+public.
 
 Before an APK can be published, CI independently checks its ZIP integrity,
 native ABI, application ID, application label, signing-certificate fingerprint,

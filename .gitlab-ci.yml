@@ -318,11 +318,19 @@ update_release_inputs:
         ':!README.md' \
         ':!certificates/ministry-ca-lock.json' \
         ':!certificates/russian_trusted_root_ca.pem'
-      test -n "$(git diff -- .gitlab-ci.yml)"
+      if [ "$CHROMIUM_CHANGED" = 1 ]; then
+        test -n "$(git diff -- .gitlab-ci.yml)"
+      else
+        git diff --exit-code -- .gitlab-ci.yml
+      fi
       test -n "$(git diff -- README.md)"
       if [ "$CA_CHANGED" = 1 ]; then
         test -n "$(git diff -- certificates/ministry-ca-lock.json)"
         test -n "$(git diff -- certificates/russian_trusted_root_ca.pem)"
+      else
+        git diff --exit-code -- \
+          certificates/ministry-ca-lock.json \
+          certificates/russian_trusted_root_ca.pem
       fi
 
       git add -- \
@@ -353,7 +361,8 @@ update_release_inputs:
       COMMIT_RESPONSE="$CI_PROJECT_DIR/release-update-artifacts/release-lock-commit.json"
       python3 - \
         "$CI_PROJECT_DIR" "$CI_COMMIT_SHA" "$LOCAL_COMMIT" \
-        "$CI_DEFAULT_BRANCH" "$COMMIT_MESSAGE [ci skip]" "$COMMIT_REQUEST" <<'PY'
+        "$CI_DEFAULT_BRANCH" "$COMMIT_MESSAGE [ci skip]" \
+        "$CHROMIUM_CHANGED" "$CA_CHANGED" "$COMMIT_REQUEST" <<'PY'
       import json
       from pathlib import Path
       import re
@@ -362,9 +371,12 @@ update_release_inputs:
 
       repository = Path(sys.argv[1]).resolve()
       base_revision, local_commit, branch, message = sys.argv[2:6]
-      output = Path(sys.argv[6])
+      chromium_changed, ca_changed = sys.argv[6:8]
+      output = Path(sys.argv[8])
       if not re.fullmatch(r"[0-9a-f]{40}", base_revision):
           raise SystemExit("invalid base revision for GitLab commit")
+      if chromium_changed not in {"0", "1"} or ca_changed not in {"0", "1"}:
+          raise SystemExit("invalid release-lock change flags")
       changed = subprocess.run(
           [
               "/usr/bin/git", "-C", str(repository), "diff-tree", "--no-commit-id",
@@ -375,16 +387,18 @@ update_release_inputs:
           text=True,
           encoding="utf-8",
       ).stdout.splitlines()
-      allowed = {
-          ".gitlab-ci.yml",
-          "README.md",
-          "certificates/ministry-ca-lock.json",
-          "certificates/russian_trusted_root_ca.pem",
-      }
-      if not changed or len(changed) != len(set(changed)) or not set(changed) <= allowed:
+      expected = {"README.md"}
+      if chromium_changed == "1":
+          expected.add(".gitlab-ci.yml")
+      if ca_changed == "1":
+          expected.update(
+              {
+                  "certificates/ministry-ca-lock.json",
+                  "certificates/russian_trusted_root_ca.pem",
+              }
+          )
+      if len(changed) != len(set(changed)) or set(changed) != expected:
           raise SystemExit(f"unsafe release-lock commit paths: {changed!r}")
-      if not {".gitlab-ci.yml", "README.md"} <= set(changed):
-          raise SystemExit("release-lock commit lacks required files")
       actions = []
       for relative_path in sorted(changed):
           path = repository / relative_path
@@ -536,7 +550,7 @@ preflight:
       RUTHENIUM_RELEASE_ID="$(
         python3 scripts/release_identity.py --root "$CI_PROJECT_DIR"
       )"
-      [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9.]+-[0-9a-f]{12}$ ]]
+      [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-ca-[0-9a-f]{12}-[0-9a-f]{12}$ ]]
       export RUTHENIUM_RELEASE_ID
       ARTIFACT_CACHE_KEY="$(
         printf '%s\n' "$RELEASE_DIGEST" "$ANDROID_ABI" "$TARGET_CPU" \
@@ -916,7 +930,7 @@ publish_github_snapshot:
       RUTHENIUM_RELEASE_ID="$(
         python3 scripts/release_identity.py --root "$CI_PROJECT_DIR"
       )"
-      [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9.]+-[0-9a-f]{12}$ ]]
+      [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-ca-[0-9a-f]{12}-[0-9a-f]{12}$ ]]
       test -d "$CI_PROJECT_DIR/artifacts"
       test -f "$CI_PROJECT_DIR/publication-artifacts/ruthenium-browser.tar.sha256"
 
