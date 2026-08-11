@@ -183,11 +183,21 @@ class ReleasePublicationTest(unittest.TestCase):
             "export ARTIFACT_CACHE_KEY", 1
         )[0]
         for component in (
-            "$RELEASE_DIGEST",
+            "$RUTHENIUM_RELEASE_ID",
             "$ANDROID_ABI",
             "$TARGET_CPU",
         ):
             self.assertIn(component, key_block)
+        self.assertNotIn("$RELEASE_DIGEST", key_block)
+        self.assertIn(
+            'grep -qxF "Ruthenium release $RUTHENIUM_RELEASE_ID" build-info.txt',
+            pipeline,
+        )
+        self.assertIn(
+            'grep -qxF "Ministry CA DER SHA-256 $MINISTRY_CA_DER_SHA256" '
+            "build-info.txt",
+            pipeline,
+        )
         self.assertIn('test ! -e "$RELEASE_APK.idsig"', pipeline)
 
     def test_release_asset_namespace_rejects_unexpected_files(self):

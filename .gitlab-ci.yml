@@ -537,23 +537,18 @@ preflight:
       keytool -exportcert -rfc -storetype PKCS12 -keystore "$SIGNING_KEYSTORE" -storepass:env RUTHENIUM_KEYSTORE_PASSWORD -alias ruthenium-release -file "$SIGNING_CERTIFICATE"
       test "$(openssl x509 -in "$SIGNING_CERTIFICATE" -noout -fingerprint -sha256 | cut -d= -f2)" = "$RUTHENIUM_SIGNING_CERT_SHA256"
 
-      # The APK is a function of the release inputs, which is exactly what the
-      # release digest covers, plus the architecture. When the key is unchanged
-      # a rebuild reproduces artifacts that already exist, so keep the finished
-      # set under it and reuse it instead. Any input change moves the digest,
-      # which moves both the key and the release identity, and rebuilds.
+      # The finished artifact set includes release metadata as well as the APK,
+      # so key it by the complete release identity and the architecture. This
+      # also invalidates old metadata when the release-ID scheme itself changes.
+      # When the key is unchanged, a rebuild reproduces the existing set.
       export ARTIFACT_CACHE_ROOT="$CI_BUILDS_DIR/ruthenium-artifact-cache"
-      RELEASE_DIGEST="$(
-        python3 scripts/release_identity.py --root "$CI_PROJECT_DIR" --field digest
-      )"
-      [[ "$RELEASE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
       RUTHENIUM_RELEASE_ID="$(
         python3 scripts/release_identity.py --root "$CI_PROJECT_DIR"
       )"
       [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-ca-[0-9a-f]{12}-[0-9a-f]{12}$ ]]
       export RUTHENIUM_RELEASE_ID
       ARTIFACT_CACHE_KEY="$(
-        printf '%s\n' "$RELEASE_DIGEST" "$ANDROID_ABI" "$TARGET_CPU" \
+        printf '%s\n' "$RUTHENIUM_RELEASE_ID" "$ANDROID_ABI" "$TARGET_CPU" \
           | sha256sum | cut -d' ' -f1
       )"
       export ARTIFACT_CACHE_KEY
@@ -569,8 +564,11 @@ preflight:
         grep -F "$RUTHENIUM_APPLICATION_ID" aapt2-badging.txt
         grep -F "application-label" aapt2-badging.txt | grep -F "Ruthenium"
         test "$(cat apk-abis.txt)" = "$ANDROID_ABI"
-        grep -qF "Revision $CHROMIUM_REVISION" build-info.txt
-        grep -qF "Chromium $CHROMIUM_VERSION" build-info.txt
+        grep -qxF "Chromium $CHROMIUM_VERSION" build-info.txt
+        grep -qxF "Revision $CHROMIUM_REVISION" build-info.txt
+        grep -qxF "Ruthenium release $RUTHENIUM_RELEASE_ID" build-info.txt
+        grep -qxF "Chromium target CPU $TARGET_CPU" build-info.txt
+        grep -qxF "Ministry CA DER SHA-256 $MINISTRY_CA_DER_SHA256" build-info.txt
         df -hT "$CI_BUILDS_DIR"
         exit 0
       fi
