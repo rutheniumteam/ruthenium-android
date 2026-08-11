@@ -1,0 +1,1146 @@
+stages:
+  - test
+  - update
+  - preflight
+  - build
+  - publish
+  - release
+  - finalize
+
+workflow:
+  rules:
+    # finalize_release marks a finished release with a private tag, and a tag
+    # ref used to start a pipeline of its own that died instantly because a tag
+    # pipeline has no CI_COMMIT_BRANCH. Nothing here is driven by tags.
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    # Any pipeline on the default branch that does not name a task is a
+    # release. Scheduled and API-triggered pipelines set the variable
+    # themselves and keep their own task; a push, a "Run pipeline" and a
+    # retry all run the release end to end with no manual job.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $RUTHENIUM_SCHEDULE_TASK == null'
+      variables:
+        RUTHENIUM_SCHEDULE_TASK: "release_update"
+    - when: always
+
+variables:
+  CHROMIUM_VERSION: "151.0.7922.108"
+  CHROMIUM_REVISION: "4744b886309d987d292e43232776d2206cccb13d"
+  CHROMIUM_BRANCH: "7922"
+  RUTHENIUM_APPLICATION_ID: "app.ruthenium.browser"
+  RUTHENIUM_SIGNING_CERT_SHA256: "38:F8:1A:A5:46:4B:33:12:3F:1F:38:25:1D:8A:17:96:31:F3:9B:FE:92:A6:BA:F7:22:4E:B2:40:E9:90:37:39"
+  GIT_DEPTH: "20"
+
+test_patch:
+  stage: test
+  tags:
+    - android
+  script:
+    - python3 -m unittest discover -s tests -v
+    - |
+      # shellcheck shell=bash
+      set -euo pipefail
+      SNAPSHOT_TEST_DIR="$(mktemp -d "$CI_PROJECT_DIR/.snapshot-test.XXXXXX")"
+      cleanup_snapshot_test() {
+        find "$SNAPSHOT_TEST_DIR" -depth -delete
+      }
+      trap cleanup_snapshot_test EXIT
+      python3 scripts/public_snapshot.py create \
+        --repository "$CI_PROJECT_DIR" \
+        --revision "$CI_COMMIT_SHA" \
+        --output "$SNAPSHOT_TEST_DIR/ruthenium-browser.tar" \
+        --report "$SNAPSHOT_TEST_DIR/report.json"
+      SNAPSHOT_TEST_SHA256="$(sha256sum "$SNAPSHOT_TEST_DIR/ruthenium-browser.tar" | cut -d' ' -f1)"
+      python3 scripts/public_snapshot.py verify \
+        --archive "$SNAPSHOT_TEST_DIR/ruthenium-browser.tar" \
+        --expected-sha256 "$SNAPSHOT_TEST_SHA256"
+    - python3 scripts/check_ministry_ca.py verify --certificate certificates/russian_trusted_root_ca.pem --lock certificates/ministry-ca-lock.json
+    - openssl x509 -in signing/ruthenium-release-cert.pem -noout -subject -issuer -serial -dates -fingerprint -sha256
+
+update_release_inputs:
+  stage: update
+  tags:
+    - android
+  timeout: 30m
+  resource_group: ruthenium-release-update
+  needs:
+    - test_patch
+  rules:
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: on_success
+      allow_failure: false
+    - when: never
+  script:
+    - |
+      # shellcheck shell=bash
+      set -euo pipefail
+      umask 077
+      test "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH"
+      git fetch --quiet origin "$CI_DEFAULT_BRANCH"
+      test "$CI_COMMIT_SHA" = "$(git rev-parse FETCH_HEAD)"
+
+      mkdir -p "$CI_PROJECT_DIR/release-update-artifacts"
+      test -n "${RUTHENIUM_GITLAB_RELEASE_TOKEN:-}"
+      [[ "$RUTHENIUM_GITLAB_RELEASE_TOKEN" =~ ^[A-Za-z0-9_.-]{20,256}$ ]]
+      CREDENTIAL_DIR="$(mktemp -d "$CI_PROJECT_DIR/.release-credentials.XXXXXX")"
+      API_CONFIG="$CREDENTIAL_DIR/api.curl"
+      printf 'header = "PRIVATE-TOKEN: %s"\n' \
+        "$RUTHENIUM_GITLAB_RELEASE_TOKEN" > "$API_CONFIG"
+      unset RUTHENIUM_GITLAB_RELEASE_TOKEN
+      chmod 0600 "$API_CONFIG"
+      RESPONSE="$(mktemp "$CI_PROJECT_DIR/.chromiumdash.XXXXXX")"
+      TAG_RESPONSE="$(mktemp "$CI_PROJECT_DIR/.chromium-tag.XXXXXX")"
+      CA_PRIMARY="$(mktemp "$CI_PROJECT_DIR/.ministry-ca-primary.XXXXXX")"
+      CA_SECONDARY="$(mktemp "$CI_PROJECT_DIR/.ministry-ca-secondary.XXXXXX")"
+      CHROMIUM_SELECTION="$CI_PROJECT_DIR/release-update-artifacts/chromium-selection.json"
+      CA_SELECTION="$CI_PROJECT_DIR/release-update-artifacts/ministry-ca-selection.json"
+      CA_CANDIDATE="$CI_PROJECT_DIR/release-update-artifacts/ministry-ca-candidate.pem"
+      cleanup_update_credentials() {
+        for secret_path in "${API_CONFIG:-}"; do
+          if [ -n "$secret_path" ] && [ -f "$secret_path" ]; then
+            shred -u -- "$secret_path"
+          fi
+        done
+        rm -f -- \
+          "$RESPONSE" "$TAG_RESPONSE" "$CA_PRIMARY" "$CA_SECONDARY" \
+          "${COMMIT_REQUEST:-}" "${TRIGGER_REQUEST:-}"
+        if [ -n "${CREDENTIAL_DIR:-}" ]; then
+          find "$CREDENTIAL_DIR" -depth -delete 2>/dev/null || true
+        fi
+      }
+      trap cleanup_update_credentials EXIT
+
+      CURRENT_RELEASE_ID="$(
+        python3 scripts/release_pipeline_state.py release-id \
+          --root "$CI_PROJECT_DIR"
+      )"
+      RELEASE_STATE="$CI_PROJECT_DIR/release-update-artifacts/current-release-state.json"
+      python3 scripts/release_pipeline_state.py ensure-resource-mode \
+        --api-url "$CI_API_V4_URL" \
+        --project-id "$CI_PROJECT_ID" \
+        --curl-config "$API_CONFIG" \
+        --key chromium-android-checkout \
+        --mode oldest_first
+      python3 scripts/release_pipeline_state.py inspect \
+        --api-url "$CI_API_V4_URL" \
+        --project-id "$CI_PROJECT_ID" \
+        --curl-config "$API_CONFIG" \
+        --ref "$CI_DEFAULT_BRANCH" \
+        --release-id "$CURRENT_RELEASE_ID" \
+        --current-pipeline-id "$CI_PIPELINE_ID" \
+        --output "$RELEASE_STATE"
+      RELEASE_DECISION="$(
+        python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["decision"])' \
+          "$RELEASE_STATE"
+      )"
+      case "$RELEASE_DECISION" in
+        complete)
+          echo "Current release is complete: $CURRENT_RELEASE_ID"
+          ;;
+        complete_unmarked)
+          COMPLETED_PIPELINE_ID="$(
+            python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["pipeline_id"])' \
+              "$RELEASE_STATE"
+          )"
+          COMPLETED_PIPELINE_SHA="$(
+            python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["pipeline_sha"])' \
+              "$RELEASE_STATE"
+          )"
+          python3 scripts/release_pipeline_state.py mark \
+            --api-url "$CI_API_V4_URL" \
+            --project-id "$CI_PROJECT_ID" \
+            --curl-config "$API_CONFIG" \
+            --pipeline-id "$COMPLETED_PIPELINE_ID" \
+            --commit-sha "$COMPLETED_PIPELINE_SHA" \
+            --release-id "$CURRENT_RELEASE_ID" \
+            --output "$CI_PROJECT_DIR/release-update-artifacts/release-marker.json"
+          ;;
+        active)
+          echo "Release $CURRENT_RELEASE_ID is still active; deferring upstream updates"
+          exit 0
+          ;;
+        retry)
+          RETRY_PIPELINE_ID="$(
+            python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["pipeline_id"])' \
+              "$RELEASE_STATE"
+          )"
+          RETRY_PIPELINE_SHA="$(
+            python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["pipeline_sha"])' \
+              "$RELEASE_STATE"
+          )"
+          echo "Retrying release $CURRENT_RELEASE_ID in pipeline $RETRY_PIPELINE_ID at its original commit"
+          python3 scripts/release_pipeline_state.py retry \
+            --api-url "$CI_API_V4_URL" \
+            --project-id "$CI_PROJECT_ID" \
+            --curl-config "$API_CONFIG" \
+            --ref "$CI_DEFAULT_BRANCH" \
+            --pipeline-id "$RETRY_PIPELINE_ID" \
+            --commit-sha "$RETRY_PIPELINE_SHA" \
+            --release-id "$CURRENT_RELEASE_ID" \
+            --output "$CI_PROJECT_DIR/release-update-artifacts/retried-pipeline.json"
+          exit 0
+          ;;
+        missing)
+          echo "Release $CURRENT_RELEASE_ID has no pipeline; starting exactly one"
+          python3 scripts/release_pipeline_state.py trigger \
+            --api-url "$CI_API_V4_URL" \
+            --project-id "$CI_PROJECT_ID" \
+            --curl-config "$API_CONFIG" \
+            --ref "$CI_DEFAULT_BRANCH" \
+            --commit-sha "$CI_COMMIT_SHA" \
+            --release-id "$CURRENT_RELEASE_ID" \
+            --output "$CI_PROJECT_DIR/release-update-artifacts/triggered-pipeline.json"
+          exit 0
+          ;;
+        invalid)
+          echo "Existing release pipeline is structurally incomplete; refusing an unsafe retry" >&2
+          exit 1
+          ;;
+        *)
+          echo "Unexpected release decision: $RELEASE_DECISION" >&2
+          exit 1
+          ;;
+      esac
+
+      curl --disable --fail --silent --show-error \
+        --proto '=https' \
+        --connect-timeout 15 \
+        --max-time 60 \
+        --max-filesize 1048576 \
+        --output "$RESPONSE" \
+        'https://chromiumdash.appspot.com/fetch_releases?platform=Android&channel=Stable&num=20'
+      python3 scripts/check_chromium_stable.py select \
+        --input "$RESPONSE" \
+        --output "$CHROMIUM_SELECTION" \
+        --current-version "$CHROMIUM_VERSION" \
+        --current-revision "$CHROMIUM_REVISION"
+
+      curl --disable --fail --silent --show-error \
+        --proto '=https' \
+        --connect-timeout 15 \
+        --max-time 60 \
+        --max-filesize 65536 \
+        --output "$CA_PRIMARY" \
+        'https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt'
+      curl --disable --fail --silent --show-error \
+        --proto '=https' \
+        --connect-timeout 15 \
+        --max-time 60 \
+        --max-filesize 65536 \
+        --output "$CA_SECONDARY" \
+        'https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer'
+      python3 scripts/check_ministry_ca.py select \
+        --primary "$CA_PRIMARY" \
+        --secondary "$CA_SECONDARY" \
+        --current "$CI_PROJECT_DIR/certificates/russian_trusted_root_ca.pem" \
+        --lock "$CI_PROJECT_DIR/certificates/ministry-ca-lock.json" \
+        --candidate "$CA_CANDIDATE" \
+        --output "$CA_SELECTION"
+
+      CHROMIUM_STATUS="$(
+        python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["status"])' \
+          "$CHROMIUM_SELECTION"
+      )"
+      CA_STATUS="$(
+        python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["status"])' \
+          "$CA_SELECTION"
+      )"
+      if [ "$CHROMIUM_STATUS" = current ] && [ "$CA_STATUS" = current ]; then
+        echo "Release inputs are current: Chromium $CHROMIUM_VERSION and the locked Ministry CA"
+        exit 0
+      fi
+      [[ "$CHROMIUM_STATUS" =~ ^(current|update)$ ]]
+      [[ "$CA_STATUS" =~ ^(current|update)$ ]]
+
+      LATEST_VERSION="$(
+        python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+          "$CHROMIUM_SELECTION"
+      )"
+      LATEST_REVISION="$(
+        python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["revision"])' \
+          "$CHROMIUM_SELECTION"
+      )"
+      [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      [[ "$LATEST_REVISION" =~ ^[0-9a-f]{40}$ ]]
+
+      CHROMIUM_CHANGED=0
+      if [ "$CHROMIUM_STATUS" = update ]; then
+        curl --disable --fail --silent --show-error \
+          --proto '=https' \
+          --connect-timeout 15 \
+          --max-time 60 \
+          --max-filesize 1048576 \
+          --output "$TAG_RESPONSE" \
+          "https://chromium.googlesource.com/chromium/src/+/refs/tags/$LATEST_VERSION?format=JSON"
+        python3 - "$TAG_RESPONSE" "$LATEST_REVISION" <<'PY'
+      import json
+      from pathlib import Path
+      import sys
+
+      data = Path(sys.argv[1]).read_bytes()
+      prefix = b")]}\'\n"
+      if not data.startswith(prefix) or len(data) > 1024 * 1024:
+          raise SystemExit("official Chromium tag response is invalid")
+      tag = json.loads(data[len(prefix):].decode("utf-8", "strict"))
+      if tag.get("commit") != sys.argv[2]:
+          raise SystemExit("ChromiumDash revision does not match the official tag")
+      print("Official Chromium release tag verification passed")
+      PY
+        python3 scripts/check_chromium_stable.py update-ci \
+          --selection "$CHROMIUM_SELECTION" \
+          --pipeline "$CI_PROJECT_DIR/.gitlab-ci.yml" \
+          --readme "$CI_PROJECT_DIR/README.md"
+        CHROMIUM_CHANGED=1
+      else
+        echo "Android Stable Chromium is already current: $CHROMIUM_VERSION"
+      fi
+
+      CA_CHANGED=0
+      if [ "$CA_STATUS" = update ]; then
+        CA_UPDATE_ARGUMENTS=(
+          update
+          --selection "$CA_SELECTION"
+          --candidate "$CA_CANDIDATE"
+          --certificate "$CI_PROJECT_DIR/certificates/russian_trusted_root_ca.pem"
+          --lock "$CI_PROJECT_DIR/certificates/ministry-ca-lock.json"
+          --readme "$CI_PROJECT_DIR/README.md"
+        )
+        python3 scripts/check_ministry_ca.py "${CA_UPDATE_ARGUMENTS[@]}"
+        CA_CHANGED=1
+      else
+        echo "The locked Ministry CA is already current"
+      fi
+
+      python3 -m unittest discover -s tests -v
+      git diff --check
+      git diff --exit-code -- . \
+        ':!.gitlab-ci.yml' \
+        ':!README.md' \
+        ':!certificates/ministry-ca-lock.json' \
+        ':!certificates/russian_trusted_root_ca.pem'
+      test -n "$(git diff -- .gitlab-ci.yml)"
+      test -n "$(git diff -- README.md)"
+      if [ "$CA_CHANGED" = 1 ]; then
+        test -n "$(git diff -- certificates/ministry-ca-lock.json)"
+        test -n "$(git diff -- certificates/russian_trusted_root_ca.pem)"
+      fi
+
+      git add -- \
+        .gitlab-ci.yml \
+        README.md \
+        certificates/ministry-ca-lock.json \
+        certificates/russian_trusted_root_ca.pem
+      git diff --cached --check
+      PUBLISH_DATE="$(date -u +%Y-%m-%dT00:00:00Z)"
+      export GIT_AUTHOR_NAME="Ruthenium Project"
+      export GIT_AUTHOR_EMAIL="ruthenium-project@localhost.invalid"
+      export GIT_AUTHOR_DATE="$PUBLISH_DATE"
+      export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+      export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+      export GIT_COMMITTER_DATE="$PUBLISH_DATE"
+      if [ "$CHROMIUM_CHANGED" = 1 ] && [ "$CA_CHANGED" = 1 ]; then
+        COMMIT_MESSAGE="Update Android Stable Chromium and Ministry CA"
+      elif [ "$CHROMIUM_CHANGED" = 1 ]; then
+        COMMIT_MESSAGE="Update Android Stable Chromium to $LATEST_VERSION"
+      else
+        COMMIT_MESSAGE="Update Ministry CA"
+      fi
+      git commit --no-gpg-sign -m "$COMMIT_MESSAGE"
+      LOCAL_COMMIT="$(git rev-parse HEAD)"
+      test "$CI_COMMIT_SHA" = "$(git rev-parse "$LOCAL_COMMIT^")"
+
+      COMMIT_REQUEST="$(mktemp "$CI_PROJECT_DIR/.release-commit.XXXXXX")"
+      COMMIT_RESPONSE="$CI_PROJECT_DIR/release-update-artifacts/release-lock-commit.json"
+      python3 - \
+        "$CI_PROJECT_DIR" "$CI_COMMIT_SHA" "$LOCAL_COMMIT" \
+        "$CI_DEFAULT_BRANCH" "$COMMIT_MESSAGE [ci skip]" "$COMMIT_REQUEST" <<'PY'
+      import json
+      from pathlib import Path
+      import re
+      import subprocess
+      import sys
+
+      repository = Path(sys.argv[1]).resolve()
+      base_revision, local_commit, branch, message = sys.argv[2:6]
+      output = Path(sys.argv[6])
+      if not re.fullmatch(r"[0-9a-f]{40}", base_revision):
+          raise SystemExit("invalid base revision for GitLab commit")
+      changed = subprocess.run(
+          [
+              "/usr/bin/git", "-C", str(repository), "diff-tree", "--no-commit-id",
+              "--name-only", "-r", base_revision, local_commit,
+          ],
+          check=True,
+          stdout=subprocess.PIPE,
+          text=True,
+          encoding="utf-8",
+      ).stdout.splitlines()
+      allowed = {
+          ".gitlab-ci.yml",
+          "README.md",
+          "certificates/ministry-ca-lock.json",
+          "certificates/russian_trusted_root_ca.pem",
+      }
+      if not changed or len(changed) != len(set(changed)) or not set(changed) <= allowed:
+          raise SystemExit(f"unsafe release-lock commit paths: {changed!r}")
+      if not {".gitlab-ci.yml", "README.md"} <= set(changed):
+          raise SystemExit("release-lock commit lacks required files")
+      actions = []
+      for relative_path in sorted(changed):
+          path = repository / relative_path
+          content = path.read_text(encoding="utf-8")
+          actions.append(
+              {"action": "update", "content": content, "file_path": relative_path}
+          )
+      request = {
+          "actions": actions,
+          "author_email": "ruthenium-project@localhost.invalid",
+          "author_name": "Ruthenium Project",
+          "branch": branch,
+          "commit_message": message,
+          "stats": False,
+      }
+      output.write_text(json.dumps(request, separators=(",", ":")), encoding="utf-8")
+      PY
+      chmod 0600 "$COMMIT_REQUEST"
+
+      git fetch --quiet origin "$CI_DEFAULT_BRANCH"
+      test "$CI_COMMIT_SHA" = "$(git rev-parse FETCH_HEAD)"
+      curl --disable --fail --silent --show-error \
+        --config "$API_CONFIG" \
+        --header 'Content-Type: application/json' \
+        --request POST \
+        --data-binary "@$COMMIT_REQUEST" \
+        --output "$COMMIT_RESPONSE" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/commits"
+      NEW_COMMIT="$(
+        python3 - "$COMMIT_RESPONSE" "$CI_COMMIT_SHA" "$COMMIT_MESSAGE [ci skip]" <<'PY'
+      import json
+      from pathlib import Path
+      import re
+      import sys
+
+      commit = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+      commit_id = commit.get("id")
+      if not isinstance(commit_id, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_id):
+          raise SystemExit("GitLab returned an invalid release-lock commit ID")
+      if commit.get("parent_ids") != [sys.argv[2]]:
+          raise SystemExit("GitLab release-lock commit has an unexpected parent")
+      if str(commit.get("message", "")).strip() != sys.argv[3]:
+          raise SystemExit("GitLab release-lock commit has an unexpected message")
+      if commit.get("author_name") != "Ruthenium Project":
+          raise SystemExit("GitLab release-lock commit has an unexpected author")
+      if commit.get("author_email") != "ruthenium-project@localhost.invalid":
+          raise SystemExit("GitLab release-lock commit has an unexpected author email")
+      print(commit_id)
+      PY
+      )"
+      git fetch --quiet origin "$CI_DEFAULT_BRANCH"
+      test "$NEW_COMMIT" = "$(git rev-parse FETCH_HEAD)"
+      test "$(git rev-parse "$LOCAL_COMMIT^{tree}")" = "$(git rev-parse "FETCH_HEAD^{tree}")"
+
+      NEW_RELEASE_ID="$(
+        python3 scripts/release_pipeline_state.py release-id \
+          --root "$CI_PROJECT_DIR"
+      )"
+      python3 scripts/release_pipeline_state.py trigger \
+        --api-url "$CI_API_V4_URL" \
+        --project-id "$CI_PROJECT_ID" \
+        --curl-config "$API_CONFIG" \
+        --ref "$CI_DEFAULT_BRANCH" \
+        --commit-sha "$NEW_COMMIT" \
+        --release-id "$NEW_RELEASE_ID" \
+        --output "$CI_PROJECT_DIR/release-update-artifacts/triggered-pipeline.json"
+  artifacts:
+    name: "ruthenium-release-update-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - release-update-artifacts/
+    expire_in: 90 days
+    when: always
+
+preflight:
+  stage: preflight
+  tags:
+    - android
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - when: on_success
+  script:
+    - test "$(uname -m)" = "x86_64"
+    - command -v git >/dev/null
+    - command -v python3 >/dev/null
+    - sudo -n true
+    - echo "Runner preflight passed"
+
+.build_apk:
+  stage: build
+  tags:
+    - android
+  timeout: 96h
+  resource_group: chromium-android-checkout
+  needs:
+    - test_patch
+    - preflight
+  script:
+    - |
+      # shellcheck shell=bash
+      set -euo pipefail
+      umask 077
+      export DEPOT_TOOLS_DIR="$CI_BUILDS_DIR/depot_tools"
+      export CHROMIUM_WORK_DIR="$CI_BUILDS_DIR/chromium-android-ru-ca-work"
+      export PATH="$DEPOT_TOOLS_DIR:$PATH"
+      export BUILD_OUTPUT_DIR="$CHROMIUM_WORK_DIR/src/out/$OUTPUT_DIRECTORY"
+      test "$(uname -m)" = "x86_64"
+      sudo -n true
+      case "$TARGET_CPU:$ANDROID_ABI:$OUTPUT_DIRECTORY" in
+        arm64:arm64-v8a:RuCaArm64|arm:armeabi-v7a:RuCaArmv7|x64:x86_64:RuCaX64) ;;
+        *) echo "unsupported target: $TARGET_CPU / $ANDROID_ABI / $OUTPUT_DIRECTORY" >&2; exit 1 ;;
+      esac
+      test -n "${RUTHENIUM_KEYSTORE_B64:-}"
+      test -n "${RUTHENIUM_KEYSTORE_PASSWORD:-}"
+      SIGNING_DIR="$(mktemp -d "$CI_PROJECT_DIR/.ruthenium-signing.XXXXXX")"
+      export SIGNING_DIR
+      export SIGNING_KEYSTORE="$SIGNING_DIR/ruthenium-release.p12"
+      export SIGNING_CERTIFICATE="$SIGNING_DIR/ruthenium-release-cert.pem"
+      export MINISTRY_CA_CERTIFICATE="$SIGNING_DIR/russian_trusted_root_ca.pem"
+      python3 "$CI_PROJECT_DIR/scripts/fetch_ministry_ca.py" --output "$MINISTRY_CA_CERTIFICATE"
+      export MINISTRY_CA_DER_SHA256="$(
+        openssl x509 -in "$MINISTRY_CA_CERTIFICATE" -outform DER | sha256sum | cut -d' ' -f1
+      )"
+      LOCKED_MINISTRY_CA_DER_SHA256="$(
+        python3 -c 'from scripts.patch_chromium import EXPECTED_DER_SHA256; print(EXPECTED_DER_SHA256)'
+      )"
+      test "$MINISTRY_CA_DER_SHA256" = "$LOCKED_MINISTRY_CA_DER_SHA256"
+      printf '%s' "$RUTHENIUM_KEYSTORE_B64" | base64 --decode > "$SIGNING_KEYSTORE"
+      cleanup_signing() {
+        shred -u -- "$SIGNING_KEYSTORE" 2>/dev/null || true
+        rm -rf -- "$SIGNING_DIR"
+      }
+      trap cleanup_signing EXIT
+      keytool -exportcert -rfc -storetype PKCS12 -keystore "$SIGNING_KEYSTORE" -storepass:env RUTHENIUM_KEYSTORE_PASSWORD -alias ruthenium-release -file "$SIGNING_CERTIFICATE"
+      test "$(openssl x509 -in "$SIGNING_CERTIFICATE" -noout -fingerprint -sha256 | cut -d= -f2)" = "$RUTHENIUM_SIGNING_CERT_SHA256"
+
+      # The APK is a function of the release inputs, which is exactly what the
+      # release digest covers, plus the architecture. When the key is unchanged
+      # a rebuild reproduces artifacts that already exist, so keep the finished
+      # set under it and reuse it instead. Any input change moves the digest,
+      # which moves both the key and the release identity, and rebuilds.
+      export ARTIFACT_CACHE_ROOT="$CI_BUILDS_DIR/ruthenium-artifact-cache"
+      RELEASE_DIGEST="$(
+        python3 scripts/release_identity.py --root "$CI_PROJECT_DIR" --field digest
+      )"
+      [[ "$RELEASE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+      RUTHENIUM_RELEASE_ID="$(
+        python3 scripts/release_identity.py --root "$CI_PROJECT_DIR"
+      )"
+      [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9.]+-[0-9a-f]{12}$ ]]
+      export RUTHENIUM_RELEASE_ID
+      ARTIFACT_CACHE_KEY="$(
+        printf '%s\n' "$RELEASE_DIGEST" "$ANDROID_ABI" "$TARGET_CPU" \
+          | sha256sum | cut -d' ' -f1
+      )"
+      export ARTIFACT_CACHE_KEY
+      export ARTIFACT_CACHE_DIR="$ARTIFACT_CACHE_ROOT/$ARTIFACT_CACHE_KEY"
+      RELEASE_APK_NAME="Ruthenium-${CHROMIUM_VERSION}-${ANDROID_ABI}.apk"
+      if [ -f "$ARTIFACT_CACHE_DIR/$RELEASE_APK_NAME.sha256" ]; then
+        echo "Reusing the artifact set built for these exact inputs: $ARTIFACT_CACHE_KEY"
+        mkdir -p "$CI_PROJECT_DIR/artifacts"
+        cp -a "$ARTIFACT_CACHE_DIR/." "$CI_PROJECT_DIR/artifacts/"
+        cd "$CI_PROJECT_DIR/artifacts"
+        sha256sum -c "$RELEASE_APK_NAME.sha256"
+        grep -Fi "${RUTHENIUM_SIGNING_CERT_SHA256//:/}" apksigner-verification.txt
+        grep -F "$RUTHENIUM_APPLICATION_ID" aapt2-badging.txt
+        grep -F "application-label" aapt2-badging.txt | grep -F "Ruthenium"
+        test "$(cat apk-abis.txt)" = "$ANDROID_ABI"
+        grep -qF "Revision $CHROMIUM_REVISION" build-info.txt
+        grep -qF "Chromium $CHROMIUM_VERSION" build-info.txt
+        df -hT "$CI_BUILDS_DIR"
+        exit 0
+      fi
+
+      if [ ! -d "$DEPOT_TOOLS_DIR/.git" ]; then
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS_DIR"
+      fi
+      mkdir -p "$CHROMIUM_WORK_DIR"
+      cd "$CHROMIUM_WORK_DIR"
+      if [ ! -f .gclient ]; then
+        fetch --no-history --nohooks android
+      fi
+      cd src
+      if git cat-file -e "${CHROMIUM_REVISION}^{commit}" 2>/dev/null; then
+        echo "Chromium commit $CHROMIUM_REVISION is already present; skipping fetch"
+      else
+        git fetch --depth=1 origin "$CHROMIUM_REVISION"
+      fi
+      mapfile -t RUTHENIUM_PATCH_TARGETS < <(python3 "$CI_PROJECT_DIR/scripts/patch_chromium.py" --list-targets)
+      CURRENT_CHROMIUM_REVISION="$(git rev-parse HEAD)"
+      git restore --source=HEAD -- "${RUTHENIUM_PATCH_TARGETS[@]}"
+      if [ "$CURRENT_CHROMIUM_REVISION" != "$CHROMIUM_REVISION" ]; then
+        git checkout --detach "$CHROMIUM_REVISION"
+      else
+        echo "Reusing Chromium checkout and ABI outputs at $CHROMIUM_REVISION; restored only known patch targets"
+      fi
+      gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REVISION"
+      build/install-build-deps.sh --no-prompt --no-chromeos-fonts
+      sudo systemctl stop lighttpd 2>/dev/null || true
+      if systemctl is-active --quiet lighttpd; then
+        echo "lighttpd must not run on the GitLab host because it conflicts with GitLab nginx" >&2
+        exit 1
+      fi
+      gclient runhooks
+      python3 "$CI_PROJECT_DIR/scripts/patch_chromium.py" --chromium-src "$CHROMIUM_WORK_DIR/src" --certificate "$MINISTRY_CA_CERTIFICATE"
+      git diff --check
+      git diff --stat -- "${RUTHENIUM_PATCH_TARGETS[@]}"
+      gn gen "$BUILD_OUTPUT_DIR" --args="$(
+        printf '%s\ntarget_cpu = "%s"' \
+          "$(cat "$CI_PROJECT_DIR/build/args.gn")" "$TARGET_CPU"
+      )"
+      # Siso reports every completed edge as a separate line. A clean Chromium
+      # build produces enough of those to hit GitLab's 4 MiB trace limit long
+      # before a late compiler error. Keep periodic progress while passing all
+      # diagnostics and non-progress output through unchanged. pipefail keeps
+      # the autoninja exit status authoritative.
+      autoninja -C "$BUILD_OUTPUT_DIR" chrome_public_apk 2>&1 \
+        | awk '
+            /\[[0-9]+\/[0-9]+\]/ {
+              progress++
+              if (progress % 250 == 0) {
+                print
+                fflush()
+              }
+              next
+            }
+            { print; fflush() }
+          '
+      mkdir -p "$CI_PROJECT_DIR/artifacts"
+      cp "$CHROMIUM_WORK_DIR/src/LICENSE" "$CI_PROJECT_DIR/artifacts/Chromium-LICENSE.txt"
+      cp "$SIGNING_CERTIFICATE" "$CI_PROJECT_DIR/artifacts/ruthenium-release-cert.pem"
+      APKSIGNER_PATH="$(find third_party/android_sdk/public/build-tools -type f -name apksigner | sort -V | tail -1)"
+      ZIPALIGN_PATH="$(find third_party/android_sdk/public/build-tools -type f -name zipalign | sort -V | tail -1)"
+      AAPT2_PATH="$(find third_party/android_sdk/public/build-tools -type f -name aapt2 | sort -V | tail -1)"
+      export APKSIGNER_PATH ZIPALIGN_PATH AAPT2_PATH
+      test -n "$APKSIGNER_PATH"
+      test -n "$ZIPALIGN_PATH"
+      test -n "$AAPT2_PATH"
+      export ALIGNED_APK="$SIGNING_DIR/Ruthenium-aligned.apk"
+      export RELEASE_APK="$CI_PROJECT_DIR/artifacts/Ruthenium-${CHROMIUM_VERSION}-${ANDROID_ABI}.apk"
+      "$ZIPALIGN_PATH" -P 16 -f 4 "$BUILD_OUTPUT_DIR/apks/ChromePublic.apk" "$ALIGNED_APK"
+      "$APKSIGNER_PATH" sign --ks "$SIGNING_KEYSTORE" --ks-type PKCS12 --ks-key-alias ruthenium-release --ks-pass env:RUTHENIUM_KEYSTORE_PASSWORD --key-pass env:RUTHENIUM_KEYSTORE_PASSWORD --v4-signing-enabled false --out "$RELEASE_APK" "$ALIGNED_APK"
+      test -s "$RELEASE_APK"
+      test ! -e "$RELEASE_APK.idsig"
+      unzip -t "$RELEASE_APK"
+      unzip -Z1 "$RELEASE_APK" | awk -F/ '/^lib\/[a-zA-Z0-9_-]+\// {print $2}' | sort -u | tee "$CI_PROJECT_DIR/artifacts/apk-abis.txt"
+      test "$(cat "$CI_PROJECT_DIR/artifacts/apk-abis.txt")" = "$ANDROID_ABI"
+      "$APKSIGNER_PATH" verify --verbose --print-certs "$RELEASE_APK" | tee "$CI_PROJECT_DIR/artifacts/apksigner-verification.txt"
+      grep -Fi "${RUTHENIUM_SIGNING_CERT_SHA256//:/}" "$CI_PROJECT_DIR/artifacts/apksigner-verification.txt"
+      "$AAPT2_PATH" dump badging "$RELEASE_APK" | tee "$CI_PROJECT_DIR/artifacts/aapt2-badging.txt"
+      grep -F "$RUTHENIUM_APPLICATION_ID" "$CI_PROJECT_DIR/artifacts/aapt2-badging.txt"
+      grep -F "application-label" "$CI_PROJECT_DIR/artifacts/aapt2-badging.txt" | grep -F "Ruthenium"
+      cd "$CI_PROJECT_DIR/artifacts"
+      sha256sum "Ruthenium-${CHROMIUM_VERSION}-${ANDROID_ABI}.apk" > "Ruthenium-${CHROMIUM_VERSION}-${ANDROID_ABI}.apk.sha256"
+      printf 'Product Ruthenium\nApplication ID %s\nChromium %s\nRevision %s\nRuthenium release %s\nArchitecture %s\nChromium target CPU %s\nScoped CA DNS names .ru,.xn--p1ai\nMinistry CA source https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt\nMinistry CA DER SHA-256 %s\nSigning certificate SHA-256 %s\n' "$RUTHENIUM_APPLICATION_ID" "$CHROMIUM_VERSION" "$CHROMIUM_REVISION" "$RUTHENIUM_RELEASE_ID" "$ANDROID_ABI" "$TARGET_CPU" "$MINISTRY_CA_DER_SHA256" "$RUTHENIUM_SIGNING_CERT_SHA256" > build-info.txt
+      rm -rf -- "$ARTIFACT_CACHE_DIR"
+      mkdir -p "$ARTIFACT_CACHE_DIR"
+      cp -a "$CI_PROJECT_DIR/artifacts/." "$ARTIFACT_CACHE_DIR/"
+      echo "Stored the artifact set under $ARTIFACT_CACHE_KEY"
+      df -hT "$CI_BUILDS_DIR"
+  artifacts:
+    name: "ruthenium-${CHROMIUM_VERSION}-${ANDROID_ABI}"
+    paths:
+      - artifacts/
+    expire_in: 30 days
+    when: on_success
+
+build_arm64:
+  extends: .build_apk
+  needs:
+    - test_patch
+    - preflight
+    - job: build_armv7
+      artifacts: false
+  variables:
+    TARGET_CPU: "arm64"
+    ANDROID_ABI: "arm64-v8a"
+    OUTPUT_DIRECTORY: "RuCaArm64"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - when: on_success
+
+build_armv7:
+  extends: .build_apk
+  variables:
+    TARGET_CPU: "arm"
+    ANDROID_ABI: "armeabi-v7a"
+    OUTPUT_DIRECTORY: "RuCaArmv7"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "release_update"'
+      when: on_success
+      allow_failure: false
+    - when: manual
+  allow_failure: true
+
+build_x86_64:
+  extends: .build_apk
+  needs:
+    - test_patch
+    - preflight
+    - job: build_armv7
+      artifacts: false
+  variables:
+    TARGET_CPU: "x64"
+    ANDROID_ABI: "x86_64"
+    OUTPUT_DIRECTORY: "RuCaX64"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "release_update"'
+      when: on_success
+      allow_failure: false
+    - when: manual
+  allow_failure: true
+
+github_preflight:
+  stage: publish
+  tags:
+    - android
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - when: manual
+      allow_failure: true
+  script:
+    - |
+      # shellcheck shell=bash
+      set -euo pipefail
+      umask 077
+      test -n "${RUTHENIUM_GITHUB_TOKEN:-}"
+      [[ "$RUTHENIUM_GITHUB_TOKEN" =~ ^github_pat_[A-Za-z0-9_]+$ ]]
+      sudo /usr/local/sbin/ruthenium-ensure-tor
+      AUTH_CONFIG="$(mktemp "$CI_PROJECT_DIR/.github-auth.XXXXXX")"
+      trap 'sudo rm -f -- "$AUTH_CONFIG"' EXIT
+      chmod 0600 "$AUTH_CONFIG"
+      printf 'header = "Authorization: Bearer %s"\n' "$RUTHENIUM_GITHUB_TOKEN" > "$AUTH_CONFIG"
+      unset RUTHENIUM_GITHUB_TOKEN
+      sudo chown ruthenium-publisher:ruthenium-publisher "$AUTH_CONFIG"
+      sudo -u ruthenium-publisher \
+        /usr/local/bin/ruthenium-with-tor \
+        "$CI_PROJECT_DIR/scripts/github_preflight.sh" "$AUTH_CONFIG"
+
+publish_github_snapshot:
+  stage: publish
+  tags:
+    - android
+  needs:
+    - test_patch
+  timeout: 30m
+  resource_group: github-publication
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: on_success
+      allow_failure: false
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+      allow_failure: false
+    - when: manual
+      allow_failure: true
+  script:
+    - |
+      # shellcheck shell=bash
+      set -euo pipefail
+      umask 077
+      test "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH"
+      if [ "${RUTHENIUM_SCHEDULE_TASK:-}" != release_update ]; then
+        test -n "${RUTHENIUM_GITLAB_RELEASE_TOKEN:-}"
+        [[ "$RUTHENIUM_GITLAB_RELEASE_TOKEN" =~ ^[A-Za-z0-9_.-]{20,256}$ ]]
+        SOURCE_GUARD_DIR="$(mktemp -d "$CI_PROJECT_DIR/.source-guard.XXXXXX")"
+        SOURCE_GUARD_CONFIG="$SOURCE_GUARD_DIR/api.curl"
+        cleanup_source_guard() {
+          if [ -f "$SOURCE_GUARD_CONFIG" ]; then
+            shred -u -- "$SOURCE_GUARD_CONFIG"
+          fi
+          find "$SOURCE_GUARD_DIR" -depth -delete 2>/dev/null || true
+        }
+        trap cleanup_source_guard EXIT
+        printf 'header = "PRIVATE-TOKEN: %s"\n' \
+          "$RUTHENIUM_GITLAB_RELEASE_TOKEN" > "$SOURCE_GUARD_CONFIG"
+        unset RUTHENIUM_GITLAB_RELEASE_TOKEN
+        chmod 0600 "$SOURCE_GUARD_CONFIG"
+        SOURCE_RELEASE_ID="$(
+          python3 scripts/release_pipeline_state.py release-id \
+            --root "$CI_PROJECT_DIR"
+        )"
+        SOURCE_RELEASE_STATE="$SOURCE_GUARD_DIR/release-state.json"
+        python3 scripts/release_pipeline_state.py inspect \
+          --api-url "$CI_API_V4_URL" \
+          --project-id "$CI_PROJECT_ID" \
+          --curl-config "$SOURCE_GUARD_CONFIG" \
+          --ref "$CI_DEFAULT_BRANCH" \
+          --release-id "$SOURCE_RELEASE_ID" \
+          --current-pipeline-id "$CI_PIPELINE_ID" \
+          --output "$SOURCE_RELEASE_STATE"
+        SOURCE_RELEASE_DECISION="$(
+          python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["decision"])' \
+            "$SOURCE_RELEASE_STATE"
+        )"
+        cleanup_source_guard
+        trap - EXIT
+        case "$SOURCE_RELEASE_DECISION" in
+          complete|complete_unmarked) ;;
+          *)
+            echo "Deferring public source update while release $SOURCE_RELEASE_ID is $SOURCE_RELEASE_DECISION"
+            exit 0
+            ;;
+        esac
+      fi
+      test -n "${RUTHENIUM_GITHUB_TOKEN:-}"
+      [[ "$RUTHENIUM_GITHUB_TOKEN" =~ ^github_pat_[A-Za-z0-9_]+$ ]]
+
+      git fetch --quiet origin "$CI_DEFAULT_BRANCH"
+      test "$CI_COMMIT_SHA" = "$(git rev-parse FETCH_HEAD)"
+
+      mkdir -p "$CI_PROJECT_DIR/publication-artifacts"
+      RUNNER_INPUT_DIR="$(mktemp -d "$CI_PROJECT_DIR/.publisher-runner.XXXXXX")"
+      PUBLISHER_HOME="/srv/"ruthenium-publisher
+      PUBLISHER_INPUT_DIR=""
+      RUNNER_AUTH_CONFIG=""
+      RUNNER_TOKEN_FILE=""
+      AUTH_CONFIG=""
+      TOKEN_FILE=""
+      cleanup_publisher_input() {
+        for credential_path in \
+          "$RUNNER_AUTH_CONFIG" "$RUNNER_TOKEN_FILE" \
+          "$AUTH_CONFIG" "$TOKEN_FILE"; do
+          if [ -n "$credential_path" ] && sudo /usr/bin/test -f "$credential_path"; then
+            sudo /usr/bin/shred -u -- "$credential_path"
+          fi
+        done
+        find "$RUNNER_INPUT_DIR" -depth -delete 2>/dev/null || true
+        if [ -n "$PUBLISHER_INPUT_DIR" ]; then
+          sudo /usr/bin/find "$PUBLISHER_INPUT_DIR" -depth -delete 2>/dev/null || true
+        fi
+      }
+      trap cleanup_publisher_input EXIT
+
+      SNAPSHOT_SOURCE="$RUNNER_INPUT_DIR/ruthenium-browser.tar"
+      SNAPSHOT_REPORT="$CI_PROJECT_DIR/publication-artifacts/public-snapshot.json"
+      python3 scripts/public_snapshot.py create \
+        --repository "$CI_PROJECT_DIR" \
+        --revision "$CI_COMMIT_SHA" \
+        --output "$SNAPSHOT_SOURCE" \
+        --report "$SNAPSHOT_REPORT"
+      SNAPSHOT_SHA256="$(sha256sum "$SNAPSHOT_SOURCE" | cut -d' ' -f1)"
+      printf '%s  %s\n' "$SNAPSHOT_SHA256" ruthenium-browser.tar \
+        > "$CI_PROJECT_DIR/publication-artifacts/ruthenium-browser.tar.sha256"
+      python3 scripts/public_snapshot.py verify \
+        --archive "$SNAPSHOT_SOURCE" \
+        --expected-sha256 "$SNAPSHOT_SHA256"
+
+      RUNNER_AUTH_CONFIG="$RUNNER_INPUT_DIR/api.curl"
+      RUNNER_TOKEN_FILE="$RUNNER_INPUT_DIR/token"
+      printf 'header = "Authorization: Bearer %s"\n' \
+        "$RUTHENIUM_GITHUB_TOKEN" > "$RUNNER_AUTH_CONFIG"
+      printf '%s' "$RUTHENIUM_GITHUB_TOKEN" > "$RUNNER_TOKEN_FILE"
+      unset RUTHENIUM_GITHUB_TOKEN
+      chmod 0600 "$SNAPSHOT_SOURCE" "$RUNNER_AUTH_CONFIG" "$RUNNER_TOKEN_FILE"
+
+      sudo install -o root -g root -m 0755 \
+        scripts/ensure_tor.py /usr/local/sbin/ruthenium-ensure-tor
+      sudo install -o root -g root -m 0755 \
+        scripts/with_tor.sh /usr/local/bin/ruthenium-with-tor
+      sudo install -d -o root -g root -m 0755 \
+        /usr/local/libexec/ruthenium
+      sudo install -o root -g root -m 0755 \
+        scripts/public_snapshot.py \
+        scripts/github_preflight.sh \
+        scripts/publish_github_snapshot.sh \
+        /usr/local/libexec/ruthenium/
+
+      PUBLISHER_INPUT_DIR="$(
+        sudo /usr/bin/mktemp -d "$PUBLISHER_HOME/.ci-input.XXXXXX"
+      )"
+      sudo chown ruthenium-publisher:ruthenium-publisher "$PUBLISHER_INPUT_DIR"
+      SNAPSHOT="$PUBLISHER_INPUT_DIR/ruthenium-browser.tar"
+      AUTH_CONFIG="$PUBLISHER_INPUT_DIR/api.curl"
+      TOKEN_FILE="$PUBLISHER_INPUT_DIR/token"
+      sudo install -o ruthenium-publisher -g ruthenium-publisher -m 0600 \
+        "$SNAPSHOT_SOURCE" "$SNAPSHOT"
+      sudo install -o ruthenium-publisher -g ruthenium-publisher -m 0600 \
+        "$RUNNER_AUTH_CONFIG" "$AUTH_CONFIG"
+      sudo install -o ruthenium-publisher -g ruthenium-publisher -m 0600 \
+        "$RUNNER_TOKEN_FILE" "$TOKEN_FILE"
+      sudo /usr/bin/shred -u -- "$RUNNER_AUTH_CONFIG" "$RUNNER_TOKEN_FILE"
+
+      sudo /usr/local/sbin/ruthenium-ensure-tor
+      sudo -u ruthenium-publisher \
+        /usr/local/bin/ruthenium-with-tor \
+        /usr/local/libexec/ruthenium/publish_github_snapshot.sh \
+          "$SNAPSHOT" "$AUTH_CONFIG" "$TOKEN_FILE" "$SNAPSHOT_SHA256"
+  artifacts:
+    name: "public-source-snapshot-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - publication-artifacts/
+    expire_in: 90 days
+    when: always
+
+.publish_github_release:
+  stage: release
+  tags:
+    - android
+  timeout: 5h
+  resource_group: github-publication
+  script:
+    - |
+      # shellcheck shell=bash
+      set -euo pipefail
+      umask 077
+      test "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH"
+      test -n "${RUTHENIUM_GITHUB_TOKEN:-}"
+      [[ "$RUTHENIUM_GITHUB_TOKEN" =~ ^github_pat_[A-Za-z0-9_]+$ ]]
+      RUTHENIUM_RELEASE_ID="$(
+        python3 scripts/release_identity.py --root "$CI_PROJECT_DIR"
+      )"
+      [[ "$RUTHENIUM_RELEASE_ID" =~ ^android-[0-9.]+-[0-9a-f]{12}$ ]]
+      test -d "$CI_PROJECT_DIR/artifacts"
+      test -f "$CI_PROJECT_DIR/publication-artifacts/ruthenium-browser.tar.sha256"
+
+      SOURCE_SNAPSHOT_SHA256="$(
+        awk 'NF == 2 && $2 == "ruthenium-browser.tar" {print $1}' \
+          "$CI_PROJECT_DIR/publication-artifacts/ruthenium-browser.tar.sha256"
+      )"
+      [[ "$SOURCE_SNAPSHOT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+      MINISTRY_CA_DER_SHA256="$(
+        python3 -c 'from scripts.patch_chromium import EXPECTED_DER_SHA256; print(EXPECTED_DER_SHA256)'
+      )"
+      [[ "$MINISTRY_CA_DER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+      RUNNER_INPUT_DIR="$(mktemp -d "$CI_PROJECT_DIR/.release-runner.XXXXXX")"
+      PUBLISHER_HOME="/srv/"ruthenium-publisher
+      PUBLISHER_INPUT_DIR=""
+      RUNNER_AUTH_CONFIG=""
+      AUTH_CONFIG=""
+      cleanup_release_input() {
+        for credential_path in "$RUNNER_AUTH_CONFIG" "$AUTH_CONFIG"; do
+          if [ -n "$credential_path" ] && sudo /usr/bin/test -f "$credential_path"; then
+            sudo /usr/bin/shred -u -- "$credential_path"
+          fi
+        done
+        find "$RUNNER_INPUT_DIR" -depth -delete 2>/dev/null || true
+        if [ -n "$PUBLISHER_INPUT_DIR" ]; then
+          sudo /usr/bin/find "$PUBLISHER_INPUT_DIR" -depth -delete 2>/dev/null || true
+        fi
+      }
+      trap cleanup_release_input EXIT
+
+      RUNNER_BUNDLE="$RUNNER_INPUT_DIR/bundle"
+      python3 scripts/prepare_github_release.py create \
+        --artifacts "$CI_PROJECT_DIR/artifacts" \
+        --output "$RUNNER_BUNDLE" \
+        --version "$CHROMIUM_VERSION" \
+        --revision "$CHROMIUM_REVISION" \
+        --release-id "$RUTHENIUM_RELEASE_ID" \
+        --abi "$ANDROID_ABI" \
+        --target-cpu "$TARGET_CPU" \
+        --application-id "$RUTHENIUM_APPLICATION_ID" \
+        --ministry-ca-der-sha256 "$MINISTRY_CA_DER_SHA256" \
+        --signing-certificate-sha256 "$RUTHENIUM_SIGNING_CERT_SHA256" \
+        --source-snapshot-sha256 "$SOURCE_SNAPSHOT_SHA256"
+      python3 scripts/prepare_github_release.py verify --bundle "$RUNNER_BUNDLE"
+
+      RUNNER_AUTH_CONFIG="$RUNNER_INPUT_DIR/api.curl"
+      printf 'header = "Authorization: Bearer %s"\n' \
+        "$RUTHENIUM_GITHUB_TOKEN" > "$RUNNER_AUTH_CONFIG"
+      unset RUTHENIUM_GITHUB_TOKEN
+      chmod 0600 "$RUNNER_AUTH_CONFIG"
+
+      sudo install -o root -g root -m 0755 \
+        scripts/ensure_tor.py /usr/local/sbin/ruthenium-ensure-tor
+      sudo install -o root -g root -m 0755 \
+        scripts/with_tor.sh /usr/local/bin/ruthenium-with-tor
+      sudo install -d -o root -g root -m 0755 \
+        /usr/local/libexec/ruthenium
+      sudo install -o root -g root -m 0755 \
+        scripts/github_preflight.sh \
+        scripts/prepare_github_release.py \
+        scripts/publish_github_release.py \
+        scripts/release_identity.py \
+        /usr/local/libexec/ruthenium/
+
+      PUBLISHER_INPUT_DIR="$(
+        sudo /usr/bin/mktemp -d "$PUBLISHER_HOME/.ci-release.XXXXXX"
+      )"
+      sudo chown ruthenium-publisher:ruthenium-publisher "$PUBLISHER_INPUT_DIR"
+      PUBLISHER_BUNDLE="$PUBLISHER_INPUT_DIR/bundle"
+      sudo install -d -o ruthenium-publisher -g ruthenium-publisher -m 0700 \
+        "$PUBLISHER_BUNDLE"
+      while IFS= read -r -d '' bundle_file; do
+        sudo install -o ruthenium-publisher -g ruthenium-publisher -m 0600 \
+          "$bundle_file" "$PUBLISHER_BUNDLE/$(basename "$bundle_file")"
+      done < <(find "$RUNNER_BUNDLE" -maxdepth 1 -type f -print0)
+      AUTH_CONFIG="$PUBLISHER_INPUT_DIR/api.curl"
+      sudo install -o ruthenium-publisher -g ruthenium-publisher -m 0600 \
+        "$RUNNER_AUTH_CONFIG" "$AUTH_CONFIG"
+      sudo /usr/bin/shred -u -- "$RUNNER_AUTH_CONFIG"
+
+      sudo /usr/local/sbin/ruthenium-ensure-tor
+      mkdir -p "$CI_PROJECT_DIR/release-publication-artifacts"
+      sudo -u ruthenium-publisher \
+        /usr/local/bin/ruthenium-with-tor \
+        /usr/bin/env -u PYTHONHOME -u PYTHONPATH \
+        /usr/bin/python3 -u /usr/local/libexec/ruthenium/publish_github_release.py \
+          --bundle "$PUBLISHER_BUNDLE" \
+          --auth-config "$AUTH_CONFIG" \
+        | tee "$CI_PROJECT_DIR/release-publication-artifacts/${ANDROID_ABI}.txt"
+  artifacts:
+    name: "github-release-${CHROMIUM_VERSION}-${ANDROID_ABI}"
+    paths:
+      - release-publication-artifacts/
+    expire_in: 90 days
+    when: always
+
+publish_github_release_arm64:
+  extends: .publish_github_release
+  variables:
+    TARGET_CPU: "arm64"
+    ANDROID_ABI: "arm64-v8a"
+  needs:
+    - build_arm64
+    - publish_github_snapshot
+  dependencies:
+    - build_arm64
+    - publish_github_snapshot
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "release_update"'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+    - when: never
+
+publish_github_release_armv7:
+  extends: .publish_github_release
+  variables:
+    TARGET_CPU: "arm"
+    ANDROID_ABI: "armeabi-v7a"
+  needs:
+    - build_armv7
+    - publish_github_snapshot
+  dependencies:
+    - build_armv7
+    - publish_github_snapshot
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "release_update"'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+    - when: never
+
+publish_github_release_x86_64:
+  extends: .publish_github_release
+  variables:
+    TARGET_CPU: "x64"
+    ANDROID_ABI: "x86_64"
+  needs:
+    - build_x86_64
+    - publish_github_snapshot
+  dependencies:
+    - build_x86_64
+    - publish_github_snapshot
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "check_release_inputs"'
+      when: never
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "release_update"'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+    - when: never
+
+finalize_release:
+  stage: finalize
+  tags:
+    - android
+  timeout: 10m
+  resource_group: ruthenium-release-update
+  needs:
+    - publish_github_release_arm64
+    - publish_github_release_armv7
+    - publish_github_release_x86_64
+  rules:
+    - if: '$RUTHENIUM_SCHEDULE_TASK == "release_update"'
+      when: on_success
+      allow_failure: false
+    - when: never
+  script:
+    - |
+      # shellcheck shell=bash
+      set -euo pipefail
+      umask 077
+      test "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH"
+      EXPECTED_RELEASE_ID="$(
+        python3 scripts/release_pipeline_state.py release-id \
+          --root "$CI_PROJECT_DIR"
+      )"
+      if [ -n "${RUTHENIUM_RELEASE_ID:-}" ]; then
+        test "$RUTHENIUM_RELEASE_ID" = "$EXPECTED_RELEASE_ID"
+      fi
+      test -n "${RUTHENIUM_GITLAB_RELEASE_TOKEN:-}"
+      [[ "$RUTHENIUM_GITLAB_RELEASE_TOKEN" =~ ^[A-Za-z0-9_.-]{20,256}$ ]]
+      FINALIZE_DIR="$(mktemp -d "$CI_PROJECT_DIR/.release-finalize.XXXXXX")"
+      FINALIZE_CONFIG="$FINALIZE_DIR/api.curl"
+      cleanup_finalize() {
+        if [ -f "$FINALIZE_CONFIG" ]; then
+          shred -u -- "$FINALIZE_CONFIG"
+        fi
+        find "$FINALIZE_DIR" -depth -delete 2>/dev/null || true
+      }
+      trap cleanup_finalize EXIT
+      printf 'header = "PRIVATE-TOKEN: %s"\n' \
+        "$RUTHENIUM_GITLAB_RELEASE_TOKEN" > "$FINALIZE_CONFIG"
+      unset RUTHENIUM_GITLAB_RELEASE_TOKEN
+      chmod 0600 "$FINALIZE_CONFIG"
+      mkdir -p "$CI_PROJECT_DIR/finalize-artifacts"
+      python3 scripts/release_pipeline_state.py mark \
+        --api-url "$CI_API_V4_URL" \
+        --project-id "$CI_PROJECT_ID" \
+        --curl-config "$FINALIZE_CONFIG" \
+        --pipeline-id "$CI_PIPELINE_ID" \
+        --commit-sha "$CI_COMMIT_SHA" \
+        --release-id "$EXPECTED_RELEASE_ID" \
+        --output "$CI_PROJECT_DIR/finalize-artifacts/release-marker.json"
+  artifacts:
+    name: "release-finalized-${CHROMIUM_VERSION}"
+    paths:
+      - finalize-artifacts/
+    expire_in: 90 days
+    when: always

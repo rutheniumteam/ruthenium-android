@@ -1,0 +1,14 @@
+[Unit]
+Description=Fail-closed network policy for the Ruthenium GitHub publisher
+After=local-fs.target
+Before=gitlab-runner.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet ruthenium_publisher
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/ruthenium-publisher.nft
+ExecStop=-/usr/sbin/nft delete table inet ruthenium_publisher
+
+[Install]
+WantedBy=multi-user.target

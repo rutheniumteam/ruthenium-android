@@ -1,0 +1,10 @@
+/chromium/
+/depot_tools/
+/.DS_Store
+__pycache__/
+*.pyc
+*.jks
+*.keystore
+*.p12
+/artifacts/
+/.ruthenium-signing.*

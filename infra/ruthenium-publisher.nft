@@ -1,0 +1,8 @@
+table inet ruthenium_publisher {
+    chain output {
+        type filter hook output priority filter; policy accept;
+
+        meta skuid "ruthenium-publisher" ip daddr != 127.0.0.0/8 reject
+        meta skuid "ruthenium-publisher" ip6 daddr != ::1 reject
+    }
+}

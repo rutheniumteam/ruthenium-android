@@ -1,0 +1,29 @@
+target_os = "android"
+chrome_public_manifest_package = "app.ruthenium.browser"
+
+is_debug = false
+is_component_build = false
+is_official_build = true
+# Keep official-build optimizations such as ThinLTO, but do not make the APK
+# depend on external Chromium and V8 PGO profiles that are not release inputs.
+chrome_pgo_phase = 0
+# Chromium falls back from PGO to Android AFDO on 32-bit official builds.
+# Disable that separate external profile as well for the same reason.
+clang_use_default_sample_profile = false
+is_java_debug = false
+
+enable_vr = false
+enable_arcore = false
+enable_openxr = false
+enable_cardboard = false
+
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+
+use_remoteexec = false
+android_static_analysis = "off"
+treat_warnings_as_errors = false
+enable_proguard_obfuscation = false
+disable_fieldtrial_testing_config = true
+generate_about_credits = true
