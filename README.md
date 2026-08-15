@@ -1,9 +1,9 @@
 # Ruthenium for Android
 
 Ruthenium is an Android build of Chromium where the Russian Trusted Root CA is a
-trust anchor constrained to the `.ru` and `.xn--p1ai` (`.рф`) DNS namespaces. The
-CA is not added to Android's system trust store, and it cannot vouch for a DNS
-name outside those two zones.
+trust anchor constrained to the `.ru`, `.xn--p1ai` (`.рф`), and `.su` DNS
+namespaces. The CA is not added to Android's system trust store, and it cannot
+vouch for a DNS name outside those three zones.
 
 The build is pinned to Android Stable Chromium `152.0.7977.42`, revision
 `db8ceb709fe92f3bb010fb982d6300e54de6dc6a`.
@@ -18,16 +18,18 @@ DNS subtrees are:
 
 - `.ru`
 - `.xn--p1ai` (the ASCII form of `.рф`)
+- `.su`
 
-The leading dot permits names below the zone — `bank.ru`, `pay.bank.ru` — rather
-than the bare TLD. A name such as `bank.ru.example.com` sits below `.com` and is
-not permitted.
+The leading dot permits names below the zone — `bank.ru`, `pay.bank.ru`,
+`archive.su` — rather than the bare TLD. A name such as `bank.ru.example.com`
+sits below `.com` and is not permitted.
 
 The constraint applies to every DNS name a certificate asserts, not only to the
 hostname being requested. A certificate for `bank.ru` that also carries
 `example.com` is therefore refused outright, even while `bank.ru` is the site
 being opened. That is the conservative direction of failure: such a site does
-not open, and no DNS name outside the two zones is trusted through this anchor.
+not open, and no DNS name outside the three zones is trusted through this
+anchor.
 
 Chromium's normal certificate checks are untouched. The requested hostname must
 still appear in the leaf SAN, and validity, signatures, revocation policy, and
@@ -75,7 +77,7 @@ The Android About screen includes:
 > **Ruthenium**
 >
 > Based on Chromium. The Russian Ministry of Digital Development certificate is
-> used for websites in the `.ru` and `.рф` domains.
+> used for websites in the `.ru`, `.рф`, and `.su` domains.
 
 The internal Java namespaces remain `org.chromium.*`; only the external Android
 application ID changes.

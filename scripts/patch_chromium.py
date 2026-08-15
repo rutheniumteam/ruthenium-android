@@ -111,7 +111,7 @@ APP_NAME_REPLACEMENTS = {
 ABOUT_SUMMARY_RESOURCE = (
     '    <string name="ruthenium_about_summary" translatable="false">'
     'Based on Chromium. The Russian Ministry of Digital Development certificate '
-    'is used for websites in the .ru and .рф domains.</string>\n'
+    'is used for websites in the .ru, .рф, and .su domains.</string>\n'
 )
 ABOUT_PREFERENCE = """    <Preference
         android:key="ruthenium_description"
@@ -198,7 +198,7 @@ def use_block() -> str:
       kRussianTrustedRootCaDer + sizeof(kRussianTrustedRootCaDer));
   // A leading dot permits subdomains only. That covers registrable names below
   // the TLD while excluding unrelated DNS namespaces.
-  russian_trusted_root->permitted_dns_names = {{".ru", ".xn--p1ai"}};
+  russian_trusted_root->permitted_dns_names = {{".ru", ".xn--p1ai", ".su"}};
   additional_certificates->trust_anchors_with_additional_constraints.push_back(
       std::move(russian_trusted_root));
 #endif  // BUILDFLAG(IS_ANDROID)

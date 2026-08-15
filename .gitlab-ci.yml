@@ -554,7 +554,7 @@ preflight:
       export RUTHENIUM_RELEASE_ID
       write_build_info() {
         local output_path="$1"
-        printf 'Product Ruthenium\nApplication ID %s\nChromium %s\nRevision %s\nRuthenium release %s\nArchitecture %s\nChromium target CPU %s\nScoped CA DNS names .ru,.xn--p1ai\nMinistry CA source https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt\nMinistry CA DER SHA-256 %s\nSigning certificate SHA-256 %s\n' "$RUTHENIUM_APPLICATION_ID" "$CHROMIUM_VERSION" "$CHROMIUM_REVISION" "$RUTHENIUM_RELEASE_ID" "$ANDROID_ABI" "$TARGET_CPU" "$MINISTRY_CA_DER_SHA256" "$RUTHENIUM_SIGNING_CERT_SHA256" > "$output_path"
+        printf 'Product Ruthenium\nApplication ID %s\nChromium %s\nRevision %s\nRuthenium release %s\nArchitecture %s\nChromium target CPU %s\nScoped CA DNS names .ru,.xn--p1ai,.su\nMinistry CA source https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt\nMinistry CA DER SHA-256 %s\nSigning certificate SHA-256 %s\n' "$RUTHENIUM_APPLICATION_ID" "$CHROMIUM_VERSION" "$CHROMIUM_REVISION" "$RUTHENIUM_RELEASE_ID" "$ANDROID_ABI" "$TARGET_CPU" "$MINISTRY_CA_DER_SHA256" "$RUTHENIUM_SIGNING_CERT_SHA256" > "$output_path"
       }
       ARTIFACT_CACHE_KEY="$(
         printf '%s\n' "$RELEASE_DIGEST" "$ANDROID_ABI" "$TARGET_CPU" \

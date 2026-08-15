@@ -155,7 +155,7 @@ def expected_build_info(
         f"Ruthenium release {release_id}\n"
         f"Architecture {abi}\n"
         f"Chromium target CPU {target_cpu}\n"
-        "Scoped CA DNS names .ru,.xn--p1ai\n"
+        "Scoped CA DNS names .ru,.xn--p1ai,.su\n"
         f"Ministry CA source {MINISTRY_CA_SOURCE}\n"
         f"Ministry CA DER SHA-256 {ministry_ca_der_sha256}\n"
         "Signing certificate SHA-256 "

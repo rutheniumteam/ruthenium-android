@@ -192,7 +192,7 @@ void GetCertificatePolicy() {{
 
         self.assertIn('#if BUILDFLAG(IS_ANDROID)', patched)
         self.assertIn(
-            'permitted_dns_names = {".ru", ".xn--p1ai"}', patched
+            'permitted_dns_names = {".ru", ".xn--p1ai", ".su"}', patched
         )
         self.assertIn(
             "trust_anchors_with_additional_constraints", patched
@@ -212,6 +212,7 @@ void GetCertificatePolicy() {{
         self.assertIn(">Ruthenium</string>", channel_constants)
         self.assertIn("Based on Chromium.", channel_constants)
         self.assertIn("Russian Ministry of Digital Development", channel_constants)
+        self.assertIn(".ru, .рф, and .su domains", channel_constants)
         self.assertEqual(
             channel_constants,
             patch_chromium.patch_channel_constants(channel_constants),
