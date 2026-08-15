@@ -235,6 +235,45 @@ def replace_once(source: str, old: str, new: str, description: str) -> str:
     return source.replace(old, new, 1)
 
 
+def guard_unique_cpp_region(
+    source: str,
+    start_pattern: str,
+    end_pattern: str,
+    fallback_statement: str,
+    description: str,
+) -> str:
+    """Guard one semantic C++ region without depending on its formatting."""
+    begin_marker = f"// BEGIN Ruthenium {description}"
+    end_marker = f"// END Ruthenium {description}"
+    marker_counts = (source.count(begin_marker), source.count(end_marker))
+    if marker_counts == (1, 1):
+        return source
+    if marker_counts != (0, 0):
+        raise ValueError(f"{description} contains an incomplete prior patch")
+
+    flags = re.MULTILINE | re.DOTALL
+    starts = list(re.finditer(start_pattern, source, flags))
+    ends = list(re.finditer(end_pattern, source, flags))
+    if len(starts) != 1 or len(ends) != 1:
+        raise ValueError(f"{description} anchor was not found exactly once")
+    start = starts[0]
+    end = ends[0]
+    if start.start() > end.start() or start.end() > end.end():
+        raise ValueError(f"{description} anchors are out of order")
+
+    indent = start.group("indent")
+    guarded = (
+        f"{indent}{begin_marker}\n"
+        "#if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_VR)\n"
+        f"{source[start.start():end.end()]}\n"
+        "#else\n"
+        f"{indent}{fallback_statement}\n"
+        "#endif\n"
+        f"{indent}{end_marker}"
+    )
+    return source[: start.start()] + guarded + source[end.end() :]
+
+
 def patch_channel_constants(source: str) -> str:
     for old, new in APP_NAME_REPLACEMENTS.items():
         source = replace_once(source, old, new, "application name")
@@ -300,69 +339,35 @@ def patch_identity_disc(source: str) -> str:
 
 
 def patch_omnibox_without_vr(source: str) -> str:
-    return replace_once(
+    return guard_unique_cpp_region(
         source,
-        """  bool is_starred_match = IsStarredMatch(match);
-  const auto& vector_icon_type = match.GetVectorIcon(is_starred_match, turl);
-
-  return controller_->client()->GetSizedIcon(vector_icon_type,
-                                             vector_icon_color);""",
-        """#if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_VR)
-  bool is_starred_match = IsStarredMatch(match);
-  const auto& vector_icon_type = match.GetVectorIcon(is_starred_match, turl);
-
-  return controller_->client()->GetSizedIcon(vector_icon_type,
-                                             vector_icon_color);
-#else
-  // Chromium 151 compiles this desktop-oriented implementation into Android
-  // even though GetVectorIcon() is unavailable when XR is disabled.
-  return gfx::Image();
-#endif""",
+        r"^(?P<indent>[ \t]*)bool\s+is_starred_match\s*=\s*"
+        r"IsStarredMatch\s*\(\s*match\s*\)\s*;",
+        r"^[ \t]*return\s+controller_->client\(\)->GetSizedIcon\s*\(\s*"
+        r"vector_icon_type\s*,\s*vector_icon_color\s*\)\s*;",
+        "return gfx::Image();",
         "Android omnibox icon fallback",
     )
 
 
 def patch_searchbox_without_vr(source: str) -> str:
-    source = replace_once(
+    source = guard_unique_cpp_region(
         source,
-        """  const bool is_bookmarked =
-      bookmark_model->IsBookmarked(match.destination_url);
-  // For starter pack suggestions, use template url to generate proper vector
-  // icon.
-  const TemplateURL* associated_keyword_turl =
-      match.associated_keyword.empty()
-          ? nullptr
-          : turl_service->GetTemplateURLForKeyword(match.associated_keyword);
-  mojom_match->icon_path = AutocompleteIconToResourceName(
-      match.GetVectorIcon(is_bookmarked, associated_keyword_turl));""",
-        """#if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_VR)
-  const bool is_bookmarked =
-      bookmark_model->IsBookmarked(match.destination_url);
-  // For starter pack suggestions, use template url to generate proper vector
-  // icon.
-  const TemplateURL* associated_keyword_turl =
-      match.associated_keyword.empty()
-          ? nullptr
-          : turl_service->GetTemplateURLForKeyword(match.associated_keyword);
-  mojom_match->icon_path = AutocompleteIconToResourceName(
-      match.GetVectorIcon(is_bookmarked, associated_keyword_turl));
-#else
-  mojom_match->icon_path = kSearchIconResourceName;
-#endif""",
+        r"^(?P<indent>[ \t]*)const\s+bool\s+is_bookmarked\s*=\s*"
+        r"bookmark_model->IsBookmarked\s*\(\s*match\.destination_url\s*\)\s*;",
+        r"^[ \t]*mojom_match->icon_path\s*=\s*AutocompleteIconToResourceName\s*"
+        r"\(\s*match\.GetVectorIcon\s*\(\s*is_bookmarked\s*,\s*"
+        r"associated_keyword_turl\s*\)\s*\)\s*;",
+        "mojom_match->icon_path = kSearchIconResourceName;",
         "Android searchbox match icon fallback",
     )
-    return replace_once(
+    return guard_unique_cpp_region(
         source,
-        """      if (action->GetIconImage().IsEmpty()) {
-        icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
-      } else {""",
-        """      if (action->GetIconImage().IsEmpty()) {
-#if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_VR)
-        icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
-#else
-        icon_path = kSearchIconResourceName;
-#endif
-      } else {""",
+        r"^(?P<indent>[ \t]*)icon_path\s*=\s*AutocompleteIconToResourceName\s*"
+        r"\(\s*action->GetVectorIcon\s*\(\s*\)\s*\)\s*;",
+        r"^[ \t]*icon_path\s*=\s*AutocompleteIconToResourceName\s*"
+        r"\(\s*action->GetVectorIcon\s*\(\s*\)\s*\)\s*;",
+        "icon_path = kSearchIconResourceName;",
         "Android searchbox action icon fallback",
     )
 
@@ -386,19 +391,44 @@ def copy_if_changed(source: Path, destination: Path) -> bool:
     return True
 
 
+def text_patch_transforms():
+    return (
+        (CHANNEL_CONSTANTS_RELATIVE_PATH, patch_channel_constants),
+        (ABOUT_PREFERENCES_RELATIVE_PATH, patch_about_preferences),
+        (ABOUT_SETTINGS_RELATIVE_PATH, patch_about_settings),
+        (SIGNIN_PREFS_RELATIVE_PATH, patch_signin_default),
+        (IDENTITY_DISC_RELATIVE_PATH, patch_identity_disc),
+        (OMNIBOX_EDIT_MODEL_RELATIVE_PATH, patch_omnibox_without_vr),
+        (SEARCHBOX_HANDLER_RELATIVE_PATH, patch_searchbox_without_vr),
+    )
+
+
+def text_target_relative_paths() -> tuple[Path, ...]:
+    return (
+        SOURCE_RELATIVE_PATH,
+        *(path for path, _ in text_patch_transforms()),
+    )
+
+
 def target_relative_paths() -> tuple[Path, ...]:
     icon_targets = tuple(Path("chrome/android/java") / path for path in ICON_TARGETS)
     return (
-        SOURCE_RELATIVE_PATH,
-        CHANNEL_CONSTANTS_RELATIVE_PATH,
-        ABOUT_PREFERENCES_RELATIVE_PATH,
-        ABOUT_SETTINGS_RELATIVE_PATH,
-        SIGNIN_PREFS_RELATIVE_PATH,
-        IDENTITY_DISC_RELATIVE_PATH,
-        OMNIBOX_EDIT_MODEL_RELATIVE_PATH,
-        SEARCHBOX_HANDLER_RELATIVE_PATH,
+        *text_target_relative_paths(),
         *icon_targets,
     )
+
+
+def check_text_patch_compatibility(
+    chromium_src: Path,
+    certificate_path: Path,
+) -> None:
+    source_path = chromium_src / SOURCE_RELATIVE_PATH
+    patch_source(
+        source_path.read_text(encoding="utf-8"),
+        load_and_verify_der(certificate_path),
+    )
+    for relative_path, transform in text_patch_transforms():
+        transform((chromium_src / relative_path).read_text(encoding="utf-8"))
 
 
 def patch_checkout(
@@ -414,16 +444,7 @@ def patch_checkout(
     if write_text_if_changed(source_path, patched):
         changed.append(SOURCE_RELATIVE_PATH)
 
-    text_patches = (
-        (CHANNEL_CONSTANTS_RELATIVE_PATH, patch_channel_constants),
-        (ABOUT_PREFERENCES_RELATIVE_PATH, patch_about_preferences),
-        (ABOUT_SETTINGS_RELATIVE_PATH, patch_about_settings),
-        (SIGNIN_PREFS_RELATIVE_PATH, patch_signin_default),
-        (IDENTITY_DISC_RELATIVE_PATH, patch_identity_disc),
-        (OMNIBOX_EDIT_MODEL_RELATIVE_PATH, patch_omnibox_without_vr),
-        (SEARCHBOX_HANDLER_RELATIVE_PATH, patch_searchbox_without_vr),
-    )
-    for relative_path, transform in text_patches:
+    for relative_path, transform in text_patch_transforms():
         path = chromium_src / relative_path
         if write_text_if_changed(path, transform(path.read_text(encoding="utf-8"))):
             changed.append(relative_path)
@@ -461,13 +482,36 @@ def main() -> None:
         action="store_true",
         help="Print Chromium-relative files modified by this patch",
     )
+    parser.add_argument(
+        "--list-text-targets",
+        action="store_true",
+        help="Print Chromium-relative text files inspected by this patch",
+    )
+    parser.add_argument(
+        "--check-text-patches",
+        action="store_true",
+        help="Validate text patch compatibility without changing files",
+    )
     args = parser.parse_args()
     if args.list_targets:
         for path in target_relative_paths():
             print(path)
         return
+    if args.list_text_targets:
+        for path in text_target_relative_paths():
+            print(path)
+        return
     if args.chromium_src is None:
-        parser.error("--chromium-src is required unless --list-targets is used")
+        parser.error(
+            "--chromium-src is required unless a --list-*-targets option is used"
+        )
+    if args.check_text_patches:
+        check_text_patch_compatibility(
+            args.chromium_src.resolve(),
+            args.certificate.resolve(),
+        )
+        print("Chromium text patch compatibility passed")
+        return
     changed = patch_checkout(
         args.chromium_src.resolve(),
         args.certificate.resolve(),

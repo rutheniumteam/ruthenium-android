@@ -295,6 +295,64 @@ void GetCertificatePolicy() {{
             patch_chromium.patch_identity_disc(identity_disc),
         )
 
+    def test_cpp_icon_patches_tolerate_layout_changes(self):
+        omnibox = """     bool is_starred_match=IsStarredMatch( match );
+     const auto& vector_icon_type =
+         match.GetVectorIcon(is_starred_match, turl);
+     return controller_->client()->GetSizedIcon(vector_icon_type, vector_icon_color);"""
+        patched_omnibox = patch_chromium.patch_omnibox_without_vr(omnibox)
+        self.assertIn("BEGIN Ruthenium Android omnibox icon fallback", patched_omnibox)
+        self.assertIn("     return gfx::Image();", patched_omnibox)
+        self.assertEqual(
+            patched_omnibox,
+            patch_chromium.patch_omnibox_without_vr(patched_omnibox),
+        )
+
+        searchbox = """    const bool is_bookmarked=bookmark_model->IsBookmarked(
+        match.destination_url);
+    const TemplateURL* associated_keyword_turl = nullptr;
+    mojom_match->icon_path=AutocompleteIconToResourceName(
+        match.GetVectorIcon( is_bookmarked,
+                             associated_keyword_turl ));
+             icon_path =
+                 AutocompleteIconToResourceName(
+                     action->GetVectorIcon( ));"""
+        patched_searchbox = patch_chromium.patch_searchbox_without_vr(searchbox)
+        self.assertIn(
+            "BEGIN Ruthenium Android searchbox match icon fallback",
+            patched_searchbox,
+        )
+        self.assertIn(
+            "BEGIN Ruthenium Android searchbox action icon fallback",
+            patched_searchbox,
+        )
+        self.assertIn(
+            "    mojom_match->icon_path = kSearchIconResourceName;",
+            patched_searchbox,
+        )
+        self.assertIn(
+            "             icon_path = kSearchIconResourceName;",
+            patched_searchbox,
+        )
+        self.assertEqual(
+            patched_searchbox,
+            patch_chromium.patch_searchbox_without_vr(patched_searchbox),
+        )
+
+    def test_cpp_icon_patches_reject_ambiguous_semantic_anchors(self):
+        match = """  const bool is_bookmarked =
+      bookmark_model->IsBookmarked(match.destination_url);
+  const TemplateURL* associated_keyword_turl = nullptr;
+  mojom_match->icon_path = AutocompleteIconToResourceName(
+      match.GetVectorIcon(is_bookmarked, associated_keyword_turl));
+"""
+        action = (
+            "  icon_path = "
+            "AutocompleteIconToResourceName(action->GetVectorIcon());\n"
+        )
+        with self.assertRaisesRegex(ValueError, "not found exactly once"):
+            patch_chromium.patch_searchbox_without_vr(match + action + action)
+
     def test_android_icon_resources_are_complete(self):
         icon_root = REPOSITORY_ROOT / patch_chromium.ICON_RESOURCES_RELATIVE_PATH
         expected_dimensions = {
@@ -398,6 +456,10 @@ void GetCertificatePolicy() {{
                 path.write_bytes(b"upstream resource")
 
             icon_root = REPOSITORY_ROOT / patch_chromium.ICON_RESOURCES_RELATIVE_PATH
+            patch_chromium.check_text_patch_compatibility(
+                chromium_src,
+                CERTIFICATE_PATH,
+            )
             changed = patch_chromium.patch_checkout(
                 chromium_src,
                 CERTIFICATE_PATH,
@@ -414,6 +476,10 @@ void GetCertificatePolicy() {{
                     CERTIFICATE_PATH,
                     icon_root,
                 ),
+            )
+            patch_chromium.check_text_patch_compatibility(
+                chromium_src,
+                CERTIFICATE_PATH,
             )
 
 

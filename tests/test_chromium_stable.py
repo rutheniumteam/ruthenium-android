@@ -110,6 +110,12 @@ class ChromiumStableTest(unittest.TestCase):
         self.assertIn("chromiumdash.appspot.com/fetch_releases", pipeline)
         self.assertIn("chromium.googlesource.com/chromium/src/+/refs/tags/", pipeline)
         self.assertIn("ChromiumDash revision does not match the official tag", pipeline)
+        self.assertIn("scripts/patch_chromium.py --list-text-targets", pipeline)
+        self.assertIn("--check-text-patches", pipeline)
+        self.assertLess(
+            pipeline.index("--check-text-patches"),
+            pipeline.index("scripts/check_chromium_stable.py update-ci"),
+        )
         self.assertIn("content/lending/russian_trusted_root_ca_pem.crt", pipeline)
         self.assertIn("content/Other/doc/russian_trusted_root_ca.cer", pipeline)
         self.assertIn("scripts/check_ministry_ca.py select", pipeline)

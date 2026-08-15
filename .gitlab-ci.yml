@@ -107,6 +107,9 @@ update_release_inputs:
         if [ -n "${CREDENTIAL_DIR:-}" ]; then
           find "$CREDENTIAL_DIR" -depth -delete 2>/dev/null || true
         fi
+        if [ -n "${PATCH_COMPATIBILITY_DIR:-}" ]; then
+          find "$PATCH_COMPATIBILITY_DIR" -depth -delete 2>/dev/null || true
+        fi
       }
       trap cleanup_update_credentials EXIT
 
@@ -286,6 +289,29 @@ update_release_inputs:
           raise SystemExit("ChromiumDash revision does not match the official tag")
       print("Official Chromium release tag verification passed")
       PY
+        PATCH_COMPATIBILITY_DIR="$(
+          mktemp -d "$CI_PROJECT_DIR/.chromium-patch-compatibility.XXXXXX"
+        )"
+        while IFS= read -r target; do
+          target_path="$PATCH_COMPATIBILITY_DIR/$target"
+          encoded_path="$target_path.base64"
+          mkdir -p "$(dirname "$target_path")"
+          curl --disable --fail --silent --show-error \
+            --proto '=https' \
+            --connect-timeout 15 \
+            --max-time 60 \
+            --max-filesize 4194304 \
+            --output "$encoded_path" \
+            "https://chromium.googlesource.com/chromium/src/+/$LATEST_REVISION/$target?format=TEXT"
+          base64 --decode "$encoded_path" > "$target_path"
+          rm -f -- "$encoded_path"
+        done < <(python3 scripts/patch_chromium.py --list-text-targets)
+        python3 scripts/patch_chromium.py \
+          --chromium-src "$PATCH_COMPATIBILITY_DIR" \
+          --certificate "$CI_PROJECT_DIR/certificates/russian_trusted_root_ca.pem" \
+          --check-text-patches
+        find "$PATCH_COMPATIBILITY_DIR" -depth -delete
+        PATCH_COMPATIBILITY_DIR=""
         python3 scripts/check_chromium_stable.py update-ci \
           --selection "$CHROMIUM_SELECTION" \
           --pipeline "$CI_PROJECT_DIR/.gitlab-ci.yml" \
