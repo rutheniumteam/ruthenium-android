@@ -252,9 +252,9 @@ void GetCertificatePolicy() {{
           : turl_service->GetTemplateURLForKeyword(match.associated_keyword);
   mojom_match->icon_path = AutocompleteIconToResourceName(
       match.GetVectorIcon(is_bookmarked, associated_keyword_turl));
-    if (action->GetIconImage().IsEmpty()) {
-      icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
-    } else {"""
+      if (action->GetIconImage().IsEmpty()) {
+        icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
+      } else {"""
         searchbox = patch_chromium.patch_searchbox_without_vr(searchbox)
         self.assertEqual(2, searchbox.count("BUILDFLAG(ENABLE_VR)"))
         self.assertEqual(2, searchbox.count("kSearchIconResourceName"))
@@ -371,9 +371,9 @@ void GetCertificatePolicy() {{
           : turl_service->GetTemplateURLForKeyword(match.associated_keyword);
   mojom_match->icon_path = AutocompleteIconToResourceName(
       match.GetVectorIcon(is_bookmarked, associated_keyword_turl));
-    if (action->GetIconImage().IsEmpty()) {
-      icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
-    } else {
+      if (action->GetIconImage().IsEmpty()) {
+        icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
+      } else {
 """
 
         with tempfile.TemporaryDirectory() as temporary_directory:

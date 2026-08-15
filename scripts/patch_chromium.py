@@ -353,16 +353,16 @@ def patch_searchbox_without_vr(source: str) -> str:
     )
     return replace_once(
         source,
-        """    if (action->GetIconImage().IsEmpty()) {
-      icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
-    } else {""",
-        """    if (action->GetIconImage().IsEmpty()) {
+        """      if (action->GetIconImage().IsEmpty()) {
+        icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
+      } else {""",
+        """      if (action->GetIconImage().IsEmpty()) {
 #if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(ENABLE_VR)
-      icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
+        icon_path = AutocompleteIconToResourceName(action->GetVectorIcon());
 #else
-      icon_path = kSearchIconResourceName;
+        icon_path = kSearchIconResourceName;
 #endif
-    } else {""",
+      } else {""",
         "Android searchbox action icon fallback",
     )
 
