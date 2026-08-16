@@ -501,7 +501,7 @@ update_release_inputs:
 preflight:
   stage: preflight
   tags:
-    - android
+    - chromium
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $RUTHENIUM_SCHEDULE_TASK == "publish_snapshot"'
       when: never
@@ -518,7 +518,7 @@ preflight:
 .build_apk:
   stage: build
   tags:
-    - android
+    - chromium
   timeout: 96h
   resource_group: chromium-android-checkout
   needs:
