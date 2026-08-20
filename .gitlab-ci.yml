@@ -524,6 +524,18 @@ preflight:
   needs:
     - test_patch
     - preflight
+  # The GPU box next door serves local models. A Chromium build peaks around
+  # 64 GiB and cannot share the host with two resident models, so wait until
+  # nothing is being generated there and take the box for the build. The helper
+  # never fails: if the box is gone, unreachable or idle-less it just steps
+  # aside. after_script runs on success, failure and cancellation alike, so the
+  # models always come back.
+  # llama-gate lives on the runner, not in this repository: it carries the
+  # address of the inference box, which has no business in a public snapshot.
+  before_script:
+    - /usr/local/bin/llama-gate take
+  after_script:
+    - /usr/local/bin/llama-gate release
   script:
     - |
       # shellcheck shell=bash
