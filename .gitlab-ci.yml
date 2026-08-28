@@ -636,7 +636,11 @@ preflight:
       CURRENT_CHROMIUM_REVISION="$(git rev-parse HEAD)"
       git restore --source=HEAD -- "${RUTHENIUM_PATCH_TARGETS[@]}"
       if [ "$CURRENT_CHROMIUM_REVISION" != "$CHROMIUM_REVISION" ]; then
-        git checkout --detach "$CHROMIUM_REVISION"
+        # --force: upstream keeps folding DEPS-managed repos into the main
+        # tree (aria-practices in M153); in a cached worktree their files are
+        # untracked leftovers a plain checkout refuses to overwrite. The tree
+        # is regenerated below by gclient sync and patch_chromium.py anyway.
+        git checkout --force --detach "$CHROMIUM_REVISION"
       else
         echo "Reusing Chromium checkout and ABI outputs at $CHROMIUM_REVISION; restored only known patch targets"
       fi
