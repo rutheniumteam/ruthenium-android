@@ -644,7 +644,57 @@ preflight:
       else
         echo "Reusing Chromium checkout and ABI outputs at $CHROMIUM_REVISION; restored only known patch targets"
       fi
-      gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REVISION"
+      # A cached checkout accumulates dependency repos left behind by earlier
+      # syncs as shallow, ref-less clones: HEAD detached at the old pin, no
+      # local refs at all. When DEPS moves such a pin, gclient's plain fetch
+      # brings branch tips but not the newly pinned revision, and the sync
+      # dies with "pathspec ... did not match any file(s) known to git"
+      # (pthreadpool, job 2325). The dependency checkouts are disposable
+      # caches, so self-heal instead of failing the release: drop exactly the
+      # dependencies gclient reports as broken and sync again, and if that
+      # still does not produce a clean tree, rebuild the working copy from
+      # scratch once. A failure that names no broken dependency is left
+      # alone: that shape is a transient (network, mirror), and nuking a
+      # warm checkout over it would only turn a retry into a day-long build.
+      SYNC_LOG="$CHROMIUM_WORK_DIR/.gclient-sync.log"
+      sync_chromium() {
+        # tee keeps the trace readable; PIPESTATUS keeps gclient authoritative.
+        gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REVISION" 2>&1 \
+          | tee "$SYNC_LOG"
+        return "${PIPESTATUS[0]}"
+      }
+      drop_broken_dependencies() {
+        local dependency found=1
+        while IFS= read -r dependency; do
+          case "$dependency" in
+            src/*) ;;
+            *) echo "not dropping unexpected dependency path: $dependency" >&2; return 1 ;;
+          esac
+          echo "Dropping broken dependency checkout: $dependency"
+          rm -rf -- "${CHROMIUM_WORK_DIR:?}/$dependency"
+          found=0
+        done < <(sed -n 's/^ *\(src\/[^ ]*\) (ERROR)$/\1/p' "$SYNC_LOG" | sort -u)
+        return "$found"
+      }
+      if ! sync_chromium; then
+        if ! grep -q ' (ERROR)$' "$SYNC_LOG"; then
+          echo "gclient sync failed without naming a broken dependency; keeping the cached checkout" >&2
+          exit 1
+        fi
+        if ! { drop_broken_dependencies && sync_chromium; }; then
+          echo "gclient sync still failing; rebuilding the Chromium working copy from scratch"
+          cd "$CI_BUILDS_DIR"
+          rm -rf -- "$CHROMIUM_WORK_DIR"
+          mkdir -p "$CHROMIUM_WORK_DIR"
+          cd "$CHROMIUM_WORK_DIR"
+          fetch --no-history --nohooks android
+          cd src
+          git fetch --depth=1 origin "$CHROMIUM_REVISION"
+          git checkout --force --detach "$CHROMIUM_REVISION"
+          gclient sync --no-history --nohooks --revision "src@$CHROMIUM_REVISION"
+        fi
+      fi
+      rm -f -- "$SYNC_LOG"
       build/install-build-deps.sh --no-prompt --no-chromeos-fonts
       sudo systemctl stop lighttpd 2>/dev/null || true
       if systemctl is-active --quiet lighttpd; then
