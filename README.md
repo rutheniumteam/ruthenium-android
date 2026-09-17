@@ -5,8 +5,8 @@ trust anchor constrained to the `.ru`, `.xn--p1ai` (`.рф`), and `.su` DNS
 namespaces. The CA is not added to Android's system trust store, and it cannot
 vouch for a DNS name outside those three zones.
 
-The build is pinned to Android Stable Chromium `154.0.8037.21`, revision
-`0fa6d91e2faf313da8332688a96bd98b9d983a4d`.
+The build is pinned to Android Stable Chromium `154.0.8037.49`, revision
+`ba187acfd59909f7d8d4fe0b5e9faa3a71ff0e92`.
 
 ## Trust boundary
 
@@ -110,7 +110,7 @@ rebuilt. Changing any build input moves the identity and rebuilds.
 
 The primary output artifact is:
 
-`artifacts/Ruthenium-154.0.8037.21-arm64-v8a.apk`
+`artifacts/Ruthenium-154.0.8037.49-arm64-v8a.apk`
 
 ## Public source publication
 
