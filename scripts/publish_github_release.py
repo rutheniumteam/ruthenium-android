@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -35,6 +36,13 @@ CURL_PATH = Path("/usr/bin/curl")
 # transfer cannot smuggle in different bytes.
 DOWNLOAD_ATTEMPTS = 4
 UPLOAD_ATTEMPTS = 3
+# A freshly uploaded multi-hundred-megabyte asset can sit in the "starter"
+# state while GitHub finalizes it, and the Tor circuit can drop during the long
+# upload and leave it stuck there for good. Wait for it to reach "uploaded"
+# before trusting it, and if it never does, delete it so the next run starts
+# clean instead of tripping over the same half-written asset forever.
+ASSET_FINALIZE_ATTEMPTS = 20
+ASSET_FINALIZE_DELAY_SECONDS = 15
 CURL_RANGE_NOT_SUPPORTED = 33
 GITHUB_API_VERSION = "2026-03-10"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -530,6 +538,64 @@ def confirm_asset(
     return refreshed
 
 
+def delete_asset(github: GitHub, asset_id: int) -> None:
+    """Remove a release asset. A missing asset is treated as already gone."""
+    status, _ = github.request("DELETE", f"{API_ROOT}/releases/assets/{asset_id}")
+    if status not in (204, 404):
+        raise ReleasePublicationError(
+            f"failed to delete GitHub asset {asset_id} (HTTP {status})"
+        )
+
+
+def asset_finalized(asset: dict[str, Any], expected_size: int) -> bool:
+    """True when GitHub reports the asset fully stored at the expected size."""
+    return asset.get("state") == "uploaded" and asset.get("size") == expected_size
+
+
+def await_asset_finalized(
+    github: GitHub, asset_id: int, expected_size: int, name: str
+) -> dict[str, Any]:
+    """Wait for a freshly uploaded asset to leave the transient 'starter' state.
+
+    GitHub finalizes a large asset asynchronously, so the upload response can
+    report a not-yet-uploaded state for a short while. Poll until it settles.
+    If it never finalizes (a dropped Tor circuit can strand it in 'starter'),
+    delete the stranded asset and fail, so the next run uploads from scratch
+    instead of forever tripping over the same half-written asset.
+    """
+    state: Any = None
+    size: Any = None
+    for attempt in range(1, ASSET_FINALIZE_ATTEMPTS + 1):
+        _, asset = github.json(
+            "GET", f"{API_ROOT}/releases/assets/{asset_id}", expected={200}
+        )
+        if not isinstance(asset, dict) or asset.get("id") != asset_id:
+            raise ReleasePublicationError("GitHub returned a different release asset")
+        state = asset.get("state")
+        size = asset.get("size")
+        if asset_finalized(asset, expected_size):
+            return asset
+        if attempt < ASSET_FINALIZE_ATTEMPTS:
+            print(
+                f"Waiting for {name} to finalize on GitHub "
+                f"(state={state}, {attempt}/{ASSET_FINALIZE_ATTEMPTS})",
+                flush=True,
+            )
+            time.sleep(ASSET_FINALIZE_DELAY_SECONDS)
+    # Only an asset that never became "uploaded" may be removed; a finalized
+    # asset is immutable even when its size is unexpected.
+    if state != "uploaded":
+        delete_asset(github, asset_id)
+        raise ReleasePublicationError(
+            f"asset {name} did not reach 'uploaded' (last state {state}, size {size}); "
+            "removed the stranded asset so the next run can re-upload it"
+        )
+    raise ReleasePublicationError(
+        f"asset {name} finalized with an unexpected size "
+        f"(size {size}, expected {expected_size}); leaving the published asset in place"
+    )
+
+
 def ensure_asset(
     *,
     github: GitHub,
@@ -547,16 +613,36 @@ def ensure_asset(
     if len(matches) > 1:
         raise ReleasePublicationError(f"duplicate GitHub release asset: {name}")
     if matches:
-        asset = confirm_asset(
-            github=github,
-            asset=matches[0],
-            expected_sha256=expected_sha256,
-            expected_size=expected_size,
-            workspace=workspace,
-            auth_config=auth_config,
+        existing = matches[0]
+        # A finalized ("uploaded") asset is immutable: verify it, never delete
+        # it. If it is uploaded but does not match, confirm_asset fails closed
+        # rather than overwriting a published asset.
+        if existing.get("state") == "uploaded":
+            asset = confirm_asset(
+                github=github,
+                asset=existing,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                workspace=workspace,
+                auth_config=auth_config,
+            )
+            print(f"Release asset is already identical: {name}")
+            return asset
+        # A half-written asset (e.g. stuck in "starter" after a dropped Tor
+        # circuit) can never be reconciled by re-checking it: GitHub will not
+        # let us overwrite it, and it blocks the whole release forever. Deleting
+        # is confined to these not-yet-finalized assets, so a published asset is
+        # never at risk. Remove it and fall through to a clean re-upload.
+        existing_id = existing.get("id")
+        if not isinstance(existing_id, int) or existing_id <= 0:
+            raise ReleasePublicationError("GitHub asset has an invalid identifier")
+        print(
+            f"Existing asset {name} is not finalized "
+            f"(state={existing.get('state')}, size={existing.get('size')}); "
+            "deleting the unfinalized asset to re-upload",
+            flush=True,
         )
-        print(f"Release asset is already identical: {name}")
-        return asset
+        delete_asset(github, existing_id)
 
     upload_url = str(release["upload_url"]).split("{", 1)[0]
     url = f"{upload_url}?{urlencode({'name': name})}"
@@ -605,6 +691,13 @@ def ensure_asset(
         raise ReleasePublicationError(f"GitHub returned no asset for {name}")
     if asset.get("name") != name:
         raise ReleasePublicationError("GitHub created an asset with an unexpected name")
+    asset_id = asset.get("id")
+    if not isinstance(asset_id, int) or asset_id <= 0:
+        raise ReleasePublicationError("GitHub asset has an invalid identifier")
+    # A large upload can land in the transient "starter" state; wait for GitHub
+    # to finalize it before the digest/size checks, otherwise a perfectly good
+    # upload fails the gate just because finalization has not happened yet.
+    asset = await_asset_finalized(github, asset_id, expected_size, name)
     asset = confirm_asset(
         github=github,
         asset=asset,

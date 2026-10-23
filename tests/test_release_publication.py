@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 from pathlib import Path
 import re
@@ -37,6 +38,39 @@ MINISTRY_CA_DER_SHA256 = patch_chromium.EXPECTED_DER_SHA256
 RELEASE_ID = (
     f"android-{VERSION}-ca-{MINISTRY_CA_DER_SHA256[:12]}-0123456789ab"
 )
+
+
+class _RecordingGitHub:
+    """Minimal GitHub double that records calls and replays canned GETs."""
+
+    def __init__(self, get_results):
+        self._get = list(get_results)
+        self.calls = []
+
+    def json(self, method, url, *, expected, body=None):
+        self.calls.append((method, url))
+        return 200, self._get.pop(0)
+
+    def request(self, method, url, *, body=None, upload=None, content_type=None):
+        self.calls.append((method, url))
+        return 204, b""
+
+
+@contextlib.contextmanager
+def _finalize_budget(attempts):
+    """Shrink the finalize poll budget and skip real sleeps during tests."""
+    saved_attempts = publish_github_release.ASSET_FINALIZE_ATTEMPTS
+    saved_delay = publish_github_release.ASSET_FINALIZE_DELAY_SECONDS
+    saved_sleep = publish_github_release.time.sleep
+    publish_github_release.ASSET_FINALIZE_ATTEMPTS = attempts
+    publish_github_release.ASSET_FINALIZE_DELAY_SECONDS = 0
+    publish_github_release.time.sleep = lambda _seconds: None
+    try:
+        yield
+    finally:
+        publish_github_release.ASSET_FINALIZE_ATTEMPTS = saved_attempts
+        publish_github_release.ASSET_FINALIZE_DELAY_SECONDS = saved_delay
+        publish_github_release.time.sleep = saved_sleep
 
 
 class ReleasePublicationTest(unittest.TestCase):
@@ -155,7 +189,19 @@ class ReleasePublicationTest(unittest.TestCase):
         self.assertIn("ruthenium-publisher", publisher)
         self.assertIn("127\\.0\\.0\\.1:9050", publisher)
         self.assertIn("download_in_new_circuit", publisher)
-        self.assertNotIn("DELETE", publisher)
+        # The publisher may delete ONLY a not-yet-finalized ("starter") asset;
+        # a published ("uploaded") asset is immutable and never deleted. The one
+        # DELETE lives in delete_asset, and every caller guards on the state.
+        self.assertEqual(1, publisher.count('"DELETE"'))
+        delete_block = publisher.split("def delete_asset", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('"DELETE"', delete_block)
+        ensure_block = publisher.split("def ensure_asset", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('existing.get("state") == "uploaded"', ensure_block)
+        self.assertIn("delete_asset(github, existing_id)", ensure_block)
+        finalize_block = publisher.split("def await_asset_finalized", 1)[1].split(
+            "\ndef ", 1
+        )[0]
+        self.assertIn('if state != "uploaded":', finalize_block)
         self.assertNotIn("requests.", publisher)
         for suffix in ("arm64", "armv7", "x86_64"):
             self.assertIn(f"publish_github_release_{suffix}:", pipeline)
@@ -509,6 +555,78 @@ class ReleasePublicationTest(unittest.TestCase):
                 "unexpected GitHub URL",
             ):
                 github.request("GET", "https://example.invalid/not-github")
+
+
+    def test_delete_asset_requires_a_success_status(self):
+        class FailingGitHub:
+            def request(self, method, url, *, body=None, upload=None, content_type=None):
+                return 500, b""
+
+        with self.assertRaisesRegex(
+            publish_github_release.ReleasePublicationError, "failed to delete"
+        ):
+            publish_github_release.delete_asset(FailingGitHub(), 7)
+
+    def test_delete_asset_treats_missing_asset_as_gone(self):
+        class GoneGitHub:
+            def request(self, method, url, *, body=None, upload=None, content_type=None):
+                return 404, b""
+
+        publish_github_release.delete_asset(GoneGitHub(), 7)
+
+    def test_await_finalized_returns_the_uploaded_asset(self):
+        github = _RecordingGitHub([{"id": 1, "state": "uploaded", "size": 12}])
+        result = publish_github_release.await_asset_finalized(github, 1, 12, "name")
+        self.assertEqual("uploaded", result["state"])
+        self.assertNotIn("DELETE", [method for method, _ in github.calls])
+
+    def test_await_finalized_deletes_a_stranded_starter(self):
+        github = _RecordingGitHub(
+            [{"id": 1, "state": "starter", "size": 12}] * 2
+        )
+        with _finalize_budget(2):
+            with self.assertRaisesRegex(
+                publish_github_release.ReleasePublicationError, "stranded"
+            ):
+                publish_github_release.await_asset_finalized(github, 1, 12, "name")
+        self.assertIn(("DELETE", ASSET_URL), github.calls)
+
+    def test_await_finalized_never_deletes_a_finalized_asset(self):
+        github = _RecordingGitHub(
+            [{"id": 1, "state": "uploaded", "size": 99}] * 2
+        )
+        with _finalize_budget(2):
+            with self.assertRaisesRegex(
+                publish_github_release.ReleasePublicationError, "unexpected size"
+            ):
+                publish_github_release.await_asset_finalized(github, 1, 12, "name")
+        self.assertNotIn("DELETE", [method for method, _ in github.calls])
+
+    def test_finalized_existing_asset_is_never_deleted(self):
+        github = _RecordingGitHub([])
+        existing = {"id": 1, "name": "asset", "state": "uploaded", "size": 12}
+        sentinel = {"id": 1, "confirmed": True}
+        original_assets = publish_github_release.release_assets
+        original_confirm = publish_github_release.confirm_asset
+        publish_github_release.release_assets = lambda github, release_id: [existing]
+        publish_github_release.confirm_asset = lambda **kwargs: sentinel
+        try:
+            result = publish_github_release.ensure_asset(
+                github=github,
+                release={"id": 1, "upload_url": "u", "draft": False},
+                path=Path("/nonexistent"),
+                name="asset",
+                content_type="application/octet-stream",
+                expected_sha256="b" * 64,
+                expected_size=12,
+                workspace=Path("/nonexistent"),
+                auth_config=Path("/nonexistent"),
+            )
+        finally:
+            publish_github_release.release_assets = original_assets
+            publish_github_release.confirm_asset = original_confirm
+        self.assertIs(sentinel, result)
+        self.assertNotIn("DELETE", [method for method, _ in github.calls])
 
 
 if __name__ == "__main__":
