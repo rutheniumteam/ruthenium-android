@@ -124,11 +124,7 @@ def validate_apk(path: Path, expected_abi: str) -> None:
                 if candidate.is_absolute() or ".." in candidate.parts:
                     raise ReleaseBundleError(f"APK contains an unsafe entry: {name!r}")
                 if len(candidate.parts) >= 3 and candidate.parts[0] == "lib":
-                    # Chromium adds an empty 64-bit placeholder lib to a
-                    # single-ABI APK for Play multiarch. It is not real native
-                    # code for that ABI, so it must not count as a second ABI.
-                    if candidate.parts[-1] != "libplaceholder.so":
-                        architectures.add(candidate.parts[1])
+                    architectures.add(candidate.parts[1])
             if architectures != {expected_abi}:
                 raise ReleaseBundleError(
                     f"APK ABI mismatch: expected {expected_abi}, found {sorted(architectures)}"

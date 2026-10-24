@@ -637,7 +637,11 @@ class ReleasePublicationTest(unittest.TestCase):
                 archive.writestr(entry, b"native fixture")
         return apk
 
-    def test_64bit_placeholder_does_not_count_as_a_second_abi(self):
+    def test_unstripped_placeholder_fails_closed(self):
+        # The build strips the 64-bit placeholder ABI before signing. If that
+        # ever regresses, validate_apk must reject the APK rather than ship one
+        # that crashes on a 64-bit device ("libchromium_android_linker.so not
+        # found") because the device picks the empty placeholder ABI.
         with tempfile.TemporaryDirectory() as temporary_directory:
             apk = self._apk_with_libs(
                 Path(temporary_directory),
@@ -646,7 +650,17 @@ class ReleasePublicationTest(unittest.TestCase):
                     "lib/arm64-v8a/libplaceholder.so",
                 ],
             )
-            prepare_github_release.validate_apk(apk, "armeabi-v7a")
+            with self.assertRaisesRegex(
+                prepare_github_release.ReleaseBundleError, "APK ABI mismatch"
+            ):
+                prepare_github_release.validate_apk(apk, "armeabi-v7a")
+
+    def test_ci_strips_non_target_abis_before_signing(self):
+        pipeline = (REPOSITORY_ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            'zip -q -d "$BUILD_OUTPUT_DIR/apks/ChromePublic.apk" "lib/$_abidir/*"',
+            pipeline,
+        )
 
     def test_real_second_abi_still_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
