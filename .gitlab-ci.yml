@@ -743,7 +743,10 @@ preflight:
       test -s "$RELEASE_APK"
       test ! -e "$RELEASE_APK.idsig"
       unzip -t "$RELEASE_APK"
-      unzip -Z1 "$RELEASE_APK" | awk -F/ '/^lib\/[a-zA-Z0-9_-]+\// {print $2}' | sort -u | tee "$CI_PROJECT_DIR/artifacts/apk-abis.txt"
+      # Chromium adds an empty 64-bit placeholder lib (libplaceholder.so) to a
+      # single-ABI APK so Play treats it as multiarch. It is not native code for
+      # that ABI, so exclude it: an ABI counts only when it ships a real .so.
+      unzip -Z1 "$RELEASE_APK" | awk -F/ '$1 == "lib" && $NF ~ /\.so$/ && $NF != "libplaceholder.so" {print $2}' | sort -u | tee "$CI_PROJECT_DIR/artifacts/apk-abis.txt"
       test "$(cat "$CI_PROJECT_DIR/artifacts/apk-abis.txt")" = "$ANDROID_ABI"
       "$APKSIGNER_PATH" verify --verbose --print-certs "$RELEASE_APK" | tee "$CI_PROJECT_DIR/artifacts/apksigner-verification.txt"
       grep -Fi "${RUTHENIUM_SIGNING_CERT_SHA256//:/}" "$CI_PROJECT_DIR/artifacts/apksigner-verification.txt"

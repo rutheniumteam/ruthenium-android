@@ -629,5 +629,39 @@ class ReleasePublicationTest(unittest.TestCase):
         self.assertNotIn("DELETE", [method for method, _ in github.calls])
 
 
+    def _apk_with_libs(self, root, lib_entries):
+        apk = root / "fixture.apk"
+        with zipfile.ZipFile(apk, mode="w") as archive:
+            archive.writestr("AndroidManifest.xml", b"fixture")
+            for entry in lib_entries:
+                archive.writestr(entry, b"native fixture")
+        return apk
+
+    def test_64bit_placeholder_does_not_count_as_a_second_abi(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            apk = self._apk_with_libs(
+                Path(temporary_directory),
+                [
+                    "lib/armeabi-v7a/libchrome.so",
+                    "lib/arm64-v8a/libplaceholder.so",
+                ],
+            )
+            prepare_github_release.validate_apk(apk, "armeabi-v7a")
+
+    def test_real_second_abi_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            apk = self._apk_with_libs(
+                Path(temporary_directory),
+                [
+                    "lib/armeabi-v7a/libchrome.so",
+                    "lib/arm64-v8a/libchrome.so",
+                ],
+            )
+            with self.assertRaisesRegex(
+                prepare_github_release.ReleaseBundleError, "APK ABI mismatch"
+            ):
+                prepare_github_release.validate_apk(apk, "armeabi-v7a")
+
+
 if __name__ == "__main__":
     unittest.main()
