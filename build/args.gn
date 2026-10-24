@@ -27,3 +27,9 @@ treat_warnings_as_errors = false
 enable_proguard_obfuscation = false
 disable_fieldtrial_testing_config = true
 generate_about_credits = true
+
+# Every release ABI ships as its own single-ABI APK. By default Chromium adds a
+# 64-bit secondary ABI to a 32-bit APK (for target_cpu "arm" the secondary ABI
+# is arm64-v8a), so the armeabi-v7a APK would carry two ABIs and fail the
+# single-ABI check. Keep each APK to exactly its target ABI.
+build_apk_secondary_abi = false
