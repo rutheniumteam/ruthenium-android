@@ -27,3 +27,8 @@ treat_warnings_as_errors = false
 enable_proguard_obfuscation = false
 disable_fieldtrial_testing_config = true
 generate_about_credits = true
+
+# Each release ships as a single-ABI APK: the CI build strips Chromium's
+# empty 64-bit multiarch placeholder lib before signing so a 64-bit device never
+# picks an empty ABI (would crash with a missing linker). Recorded here so it is
+# part of the release identity, since it changes the packaged output.
