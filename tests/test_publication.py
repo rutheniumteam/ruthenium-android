@@ -189,6 +189,64 @@ class PublicSnapshotTest(unittest.TestCase):
         self.assertIn("/usr/local/bin/ruthenium-with-tor", pipeline)
         self.assertIn("/usr/local/libexec/ruthenium/publish_github_snapshot.sh", pipeline)
 
+    def tor_git_function(self, with_tor: Path) -> str:
+        publisher = (
+            REPOSITORY_ROOT / "scripts/publish_github_snapshot.sh"
+        ).read_text(encoding="utf-8")
+        start = publisher.index("readonly TOR_GIT_ATTEMPTS=")
+        end = publisher.index("\n}\n", start) + 3
+        return publisher[start:end].replace(
+            "/usr/local/bin/ruthenium-with-tor", str(with_tor)
+        )
+
+    def run_tor_git(self, statuses: list[int]) -> tuple[int, int]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            counter = root / "calls"
+            counter.write_text("0")
+            with_tor = root / "with_tor.sh"
+            codes = " ".join(str(status) for status in statuses)
+            with_tor.write_text(
+                "#!/usr/bin/env bash\n"
+                f"codes=({codes})\n"
+                f'n="$(cat {counter})"\n'
+                f'echo "$((n + 1))" > {counter}\n'
+                'exit "${codes[$n]}"\n'
+            )
+            with_tor.chmod(0o700)
+            script = (
+                self.tor_git_function(with_tor)
+                + "tor_git true\nexit \"$?\"\n"
+            )
+            result = subprocess.run(
+                ["/usr/bin/bash", "-c", script],
+                capture_output=True,
+                check=False,
+            )
+            return result.returncode, int(counter.read_text())
+
+    def test_publisher_bounds_stalled_git_transfers(self):
+        publisher = (
+            REPOSITORY_ROOT / "scripts/publish_github_snapshot.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("export GIT_HTTP_LOW_SPEED_LIMIT=", publisher)
+        self.assertIn("export GIT_HTTP_LOW_SPEED_TIME=", publisher)
+        for step in (
+            "ls-remote --exit-code --heads",
+            "fetch --quiet --depth=1 origin",
+            'push --quiet origin',
+        ):
+            line = next(line for line in publisher.splitlines() if step in line)
+            self.assertIn("tor_git /usr/bin/git", line)
+        self.assertIn("tor_git \\\n  /usr/bin/env \\\n    -u GIT_ASKPASS", publisher)
+
+    def test_tor_git_retries_only_fatal_network_failures(self):
+        self.assertEqual(self.run_tor_git([0]), (0, 1))
+        self.assertEqual(self.run_tor_git([128, 0]), (0, 2))
+        self.assertEqual(self.run_tor_git([128, 128, 128]), (128, 3))
+        self.assertEqual(self.run_tor_git([2]), (2, 1))
+        self.assertEqual(self.run_tor_git([1]), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,14 +78,39 @@ export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_TERMINAL_PROMPT=0
 export RUTHENIUM_GITHUB_TOKEN_FILE="$TOKEN_FILE"
+# A Tor circuit can stall in the middle of a transfer. Without a low-speed
+# limit git then waits until the circuit is torn down, which once took 16
+# minutes and still failed the job. Abort a stalled transfer after a minute.
+export GIT_HTTP_LOW_SPEED_LIMIT=1000
+export GIT_HTTP_LOW_SPEED_TIME=60
+
+# Network git steps get a few attempts, each through with_tor.sh again and
+# therefore on a fresh verified circuit, like publish_github_release.py does.
+# Only git's fatal status (128: network, TLS, early EOF) is retried; any other
+# status, such as ls-remote's 2 for a missing branch or a rejected push, is
+# returned at once.
+readonly TOR_GIT_ATTEMPTS=3
+readonly GIT_FATAL_STATUS=128
+tor_git() {
+  local attempt status
+  for attempt in $(/usr/bin/seq 1 "$TOR_GIT_ATTEMPTS"); do
+    status=0
+    /usr/local/bin/ruthenium-with-tor "$@" || status="$?"
+    if [ "$status" -ne "$GIT_FATAL_STATUS" ]; then
+      return "$status"
+    fi
+    echo "git network step failed on attempt $attempt/$TOR_GIT_ATTEMPTS" >&2
+  done
+  return "$status"
+}
 
 /usr/bin/git -C "$REPOSITORY" init --quiet --initial-branch=main
 /usr/bin/git -C "$REPOSITORY" remote add origin "$GITHUB_REMOTE"
 REMOTE_HEAD=""
 REMOTE_TREE=""
-if /usr/bin/git -C "$REPOSITORY" ls-remote --exit-code --heads \
+if tor_git /usr/bin/git -C "$REPOSITORY" ls-remote --exit-code --heads \
   origin refs/heads/main >/dev/null; then
-  /usr/bin/git -C "$REPOSITORY" fetch --quiet --depth=1 origin refs/heads/main
+  tor_git /usr/bin/git -C "$REPOSITORY" fetch --quiet --depth=1 origin refs/heads/main
   REMOTE_HEAD="$(/usr/bin/git -C "$REPOSITORY" rev-parse FETCH_HEAD)"
   REMOTE_TREE="$(/usr/bin/git -C "$REPOSITORY" rev-parse 'FETCH_HEAD^{tree}')"
 else
@@ -128,7 +153,7 @@ else
       /usr/bin/git -C "$REPOSITORY" commit-tree "${COMMIT_TREE_ARGS[@]}"
   )"
   readonly PUBLIC_COMMIT
-  /usr/bin/git -C "$REPOSITORY" push --quiet origin \
+  tor_git /usr/bin/git -C "$REPOSITORY" push --quiet origin \
     "$PUBLIC_COMMIT:refs/heads/main"
   echo "Published sanitized source commit $PUBLIC_COMMIT"
 fi
@@ -136,7 +161,7 @@ fi
 readonly VERIFICATION_REPOSITORY="$WORK_ROOT/verification"
 /usr/bin/mkdir -m 0700 "$VERIFICATION_REPOSITORY"
 /usr/bin/git -C "$VERIFICATION_REPOSITORY" init --quiet --initial-branch=main
-/usr/local/bin/ruthenium-with-tor \
+tor_git \
   /usr/bin/env \
     -u GIT_ASKPASS \
     -u RUTHENIUM_GITHUB_TOKEN_FILE \
